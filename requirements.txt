@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+gunicorn
+python-dotenv
+azure-cosmos
+python-jose[cryptography]
+passlib[bcrypt]
+requests
+rank-bm25
+numpy
+sentence-transformers
