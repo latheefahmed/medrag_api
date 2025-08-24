@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.dist-info/
+build/
+dist/
+.cache/
+.pytest_cache/
+.coverage
+.mypy_cache/
+
+# Env & secrets
+.env
+.env.*
+*.env
+
+# App caches
+cache_pplx_mesh_pubmedrag/
+
+# Editors/OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
