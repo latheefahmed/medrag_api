@@ -24,8 +24,19 @@ jobs:
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}   # should be lathad046
+          username: ${{ secrets.DOCKERHUB_USERNAME }}   # must be lathad046
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Preflight sanity (list files)
+        run: |
+          echo "PWD=$(pwd)"
+          ls -la
+          echo "---- Dockerfile ----"
+          sed -n '1,200p' Dockerfile || true
+          echo "---- requirements.txt ----"
+          sed -n '1,200p' requirements.txt || true
+          echo "---- app/ ----"
+          ls -la app || true
 
       - name: Extract metadata (tags, labels)
         id: meta
@@ -36,12 +47,16 @@ jobs:
             type=raw,value=latest
             type=sha
 
-      - name: Build and push
+      - name: Build and push (verbose)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
           provenance: false
+          no-cache: true
+          build-args: |
+            BUILDKIT_INLINE_CACHE=0
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          sbom: false
