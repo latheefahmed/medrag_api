@@ -9,3 +9,5 @@ requests
 rank-bm25
 numpy
 sentence-transformers
+email-validator
+
