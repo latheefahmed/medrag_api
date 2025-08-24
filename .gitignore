@@ -25,3 +25,4 @@ cache_pplx_mesh_pubmedrag/
 .vscode/
 .DS_Store
 Thumbs.db
+.env.local
