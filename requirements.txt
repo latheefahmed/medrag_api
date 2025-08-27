@@ -1,13 +1,30 @@
-fastapi
-uvicorn[standard]
-gunicorn
-python-dotenv
-azure-cosmos
-python-jose[cryptography]
-passlib[bcrypt]
-requests
-rank-bm25
-numpy
-sentence-transformers
-email-validator
+# --- API & framework ---
+fastapi>=0.110
+uvicorn[standard]>=0.27
+gunicorn>=21.2          # optional on Windows; used for Linux deploys
+python-dotenv>=1.0
 
+# --- Auth & security ---
+python-jose[cryptography]>=3.3
+passlib[bcrypt]>=1.7
+email-validator>=2.1
+
+# --- Azure Cosmos DB ---
+azure-cosmos>=4.6
+
+# --- HTTP & utilities ---
+requests>=2.31
+urllib3>=1.26
+
+# --- Retrieval / ranking ---
+rank-bm25>=0.2
+numpy>=1.26
+
+# --- Embeddings (LlamaIndex + HuggingFace) ---
+llama-index>=0.10.30
+llama-index-embeddings-huggingface>=0.1.4
+sentence-transformers>=2.6
+
+# PyTorch is required by sentence-transformers/HF embeddings.
+# This generic spec should pull a compatible CPU wheel for Py3.12 on Windows.
+torch>=2.2

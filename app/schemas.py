@@ -25,20 +25,31 @@ class SessionPatch(BaseModel):
     meta: Optional[Dict[str, Any]] = None
 
 # ==================  ASK  ==================
-# Accept BOTH the new shape {session_id, text} and the legacy {question}
+# Accept BOTH the new shape {session_id, text|q} and the legacy {question}
 class AskInput(BaseModel):
     session_id: Optional[str] = None
+    q: Optional[str] = None
     text: Optional[str] = None
     question: Optional[str] = None  # legacy frontend support
 
 # -------- Types the frontend expects back from /ask --------
 MsgRole = Literal["user", "assistant", "system"]
 
+class Reference(BaseModel):
+    pmid: Optional[str] = None
+    title: str
+    journal: Optional[str] = None
+    year: Optional[int] = None
+    score: Optional[float] = None
+    url: Optional[str] = None
+    abstract: Optional[str] = None
+
 class Message(BaseModel):
     id: str
     role: MsgRole
     content: str
     ts: int
+    references: Optional[List[Reference]] = None
 
 class RetrievedDoc(BaseModel):
     pmid: Optional[str] = None

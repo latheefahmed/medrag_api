@@ -2,8 +2,6 @@
 from typing import List, Optional
 from pydantic import BaseModel
 
-# Mirrors your frontend types (RightPaneData, RankedDoc, BooleanItem, etc.)
-
 class RankedDoc(BaseModel):
     pmid: str
     title: str
@@ -11,6 +9,7 @@ class RankedDoc(BaseModel):
     year: Optional[int] = None
     url: Optional[str] = None
     score: Optional[float] = None
+    abstract: Optional[str] = None
 
 class BooleanItem(BaseModel):
     group: str
@@ -40,9 +39,14 @@ class RightPaneData(BaseModel):
     evidence: List[EvidenceItem] = []
     overview: Optional[Overview] = None
     plan: Optional[PlanLite] = None
-    # keep camelCase to match FE prop name exactly
-    evidencePack: Optional[str] = None
+    evidencePack: Optional[str] = None  # camelCase to match FE
 
-class AskOutput(BaseModel):
-    message: str               # the assistant chat text we’ll append to the session
-    rightPane: RightPaneData   # everything the right-side panel needs
+# Additional type you might want to expose elsewhere
+class Reference(BaseModel):
+    pmid: Optional[str] = None
+    title: str
+    journal: Optional[str] = None
+    year: Optional[int] = None
+    score: Optional[float] = None
+    url: Optional[str] = None
+    abstract: Optional[str] = None
