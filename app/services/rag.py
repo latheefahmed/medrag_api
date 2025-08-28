@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# app/services/rag.py
 import os, re, json, time, textwrap, requests, numpy as np
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Any, Optional, Tuple
@@ -7,26 +8,39 @@ from urllib3.util import Retry
 from rank_bm25 import BM25Okapi
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
+# ---- optional embedding cache (in-memory or Qdrant via app.services.embed_cache) ----
+try:
+    from app.services.embed_cache import (
+        cache_query_vec, cache_doc_vec,
+        try_get_query_vec, try_get_doc_vecs,
+    )
+except Exception:
+    def cache_query_vec(*a, **k): pass
+    def cache_doc_vec(*a, **k): pass
+    def try_get_query_vec(*a, **k): return None
+    def try_get_doc_vecs(*a, **k): return {}
+
 # ================= config =================
 @dataclass
-class PPLXCfg: 
+class PPLXCfg:
     url:str="https://api.perplexity.ai/chat/completions"
     model_plan:str=os.getenv("PPLX_MODEL_PLAN","sonar-pro")
     model_summary:str=os.getenv("PPLX_MODEL_SUMMARY","sonar-pro")
+    model_guard:str=os.getenv("PPLX_MODEL_GUARD","sonar-pro")
     temperature:float=float(os.getenv("PPLX_TEMPERATURE","0.15"))
     max_tokens:int=int(os.getenv("PPLX_MAX_TOKENS","900"))
     search_mode_plan:Optional[str]="academic"
     search_mode_summary:Optional[str]=None
 
 @dataclass
-class PubMedCfg: 
+class PubMedCfg:
     base:str="https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
     email:str=os.getenv("CONTACT_EMAIL","you@example.com")
-    tool:str="rag_bm25_embed_mmr"
+    tool:str="medrag_rag_fast"
     sleep_no_key:float=0.36
     sleep_with_key:float=0.12
-    retmax_probe:int=20
-    retmax_main:int=120
+    retmax_probe:int=15       # ↓ probe fewer
+    retmax_main:int=40        # ↓ pull fewer IDs overall
     timeout:float=60.0
 
 @dataclass
@@ -37,17 +51,17 @@ class RankCfg:
     w_bm25:float=0.45
     w_bonus:float=0.05
     mmr_lambda:float=0.70
-    mmr_take:int=40
+    mmr_take:int=10           # ↓ only consider top 10 for MMR
 
 @dataclass
 class RetrievalCfg:
-    topk_titles:int=36
-    final_take:int=20
+    topk_titles:int=12        # ↓ re-rank fewer titles via BM25
+    final_take:int=10         # final docs handed to summary
     min_final:int=5
 
 @dataclass
 class SummaryCfg:
-    top_docs_for_pack:int=5   # ALWAYS 5
+    top_docs_for_pack:int=5
     abstract_chars:int=650
 
 @dataclass
@@ -59,7 +73,8 @@ class BooleanCfg:
 @dataclass
 class Cfg:
     pplx:PPLXCfg=field(default_factory=PPLXCfg)
-    pubmed:PubMedCfg=field(default_factory=PubMedCfg)
+    pubmed:PubMedCfg=field(default_factory(PubMedCfg)
+    )
     rank:RankCfg=field(default_factory=RankCfg)
     retrieval:RetrievalCfg=field(default_factory=RetrievalCfg)
     summary:SummaryCfg=field(default_factory=SummaryCfg)
@@ -68,7 +83,7 @@ class Cfg:
 
 CFG=Cfg()
 
-# keys (env)
+# env keys
 PPLX_KEY=os.getenv("PERPLEXITY_API_KEY","").strip()
 PUBMED_KEY=os.getenv("PUBMED_API_KEY","").strip()
 
@@ -97,24 +112,31 @@ norm=lambda s: re.sub(r"\s+"," ",(s or "").replace("–","-").replace("—","-")
 tok=lambda s: re.findall(r"[A-Za-z0-9\-\+]+",(s or ""))
 q_ta=lambda p: f"\"{norm(p)}\"[Title/Abstract]" if " " in norm(p) else f"{norm(p)}[Title/Abstract]"
 pmid_url=lambda p: f"https://pubmed.ncbi.nlm.nih.gov/{p}/"
-def minmax(a): 
+def minmax(a):
     if a.size==0:return a
     mn,mx=float(a.min()),float(a.max()); return np.ones_like(a)*0.5 if mx-mn<1e-12 else (a-mn)/(mx-mn)
 
-# ================= embeddings (HF via LlamaIndex) =================
+# ================= embeddings =================
 class Embedder:
     def __init__(self,name): self._li=HuggingFaceEmbedding(model_name=name)
     def encode(self,texts,batch):
         if not texts: return np.zeros((0,768),dtype=np.float32)
         out=[]
         for i in range(0,len(texts),batch):
-            out += [self._li.get_text_embedding(t) for t in texts[i:i+batch]]
+            out+=[self._li.get_text_embedding(t) for t in texts[i:i+batch]]
         V=np.asarray(out,dtype=np.float32); norms=np.linalg.norm(V,axis=1,keepdims=True)+1e-12; return V/norms
-_EMB=Embedder(CFG.rank.embedder); embed=lambda xs: _EMB.encode(xs, CFG.rank.embed_batch)
+_EMB=Embedder(CFG.rank.embedder)
 
-# ================= pplx =================
-def pplx(messages,model,search_mode=None,temp=None,maxtok=None):
+def embed(texts: List[str]) -> np.ndarray:
+    if not texts: return np.zeros((0,768), dtype=np.float32)
+    return _EMB.encode(texts, CFG.rank.embed_batch)
+
+# ================= Perplexity =================
+def _need_pplx():
     if not PPLX_KEY: raise RuntimeError("Perplexity API key missing or invalid (set PERPLEXITY_API_KEY).")
+
+def pplx(messages,model,search_mode=None,temp=None,maxtok=None):
+    _need_pplx()
     h={"Authorization":f"Bearer {PPLX_KEY}","Content-Type":"application/json"}
     body={"model":model,"messages":messages,"stream":False,
           "temperature":CFG.pplx.temperature if temp is None else temp,
@@ -123,6 +145,7 @@ def pplx(messages,model,search_mode=None,temp=None,maxtok=None):
     r=S.post(CFG.pplx.url,headers=h,json=body,timeout=CFG.pubmed.timeout)
     if r.status_code==401: raise RuntimeError("Perplexity API key invalid.")
     r.raise_for_status(); return (r.json().get("choices",[{}])[0].get("message",{}) or {}).get("content","")
+
 def json_from_text(t):
     t=re.sub(r"```(?:json)?\s*|\s*```","",t or "").strip()
     o=[m.start() for m in re.finditer(r"\{",t)]; c=[m.start() for m in re.finditer(r"\}",t)]
@@ -133,20 +156,50 @@ def json_from_text(t):
         try: return json.loads(chunk)
         except Exception: return None
 
+# ================= guardrails =================
+def guardrail_domain(query: str) -> Dict[str, Any]:
+    sys = textwrap.dedent("""
+    You are a strict gatekeeper for a PubMed-backed biomedical QA system.
+    Output STRICT JSON only.
+    Consider a query "domain_relevant" ONLY if it primarily concerns human biomedical/clinical research,
+    diseases, diagnostics, interventions, pharmacology, physiology, epidemiology, or public health.
+    JSON schema: {"domain_relevant": true, "reason": "short justification"}
+    """).strip()
+    user = json.dumps({"query": norm(query)}, ensure_ascii=False)
+    try:
+        content = pplx(
+            [{"role":"system","content":sys},
+             {"role":"user","content":user}],
+            CFG.pplx.model_guard,
+            CFG.pplx.search_mode_plan,
+            temp=0.0, maxtok=120
+        )
+        js = json_from_text(content)
+    except Exception:
+        js = None
+    if not js:
+        words = [t for t in tok(query) if t.lower() not in STOP]
+        return {"domain_relevant": len(words) >= 2, "reason": "Heuristic fallback"}
+    return {"domain_relevant": bool(js.get("domain_relevant", False)), "reason": str(js.get("reason",""))}
+
 # ================= planner =================
 def plan_tokens(query):
     sys=textwrap.dedent("""You are a biomedical retrieval planner. Output STRICT JSON only.
-GOAL: minimal, precise PubMed units; fix minor typos; do NOT invent. Extract short tokens (≤3 words). Group: Disease, Intervention, Comparator, Outcome, Population, Context. Add MeSH hints only if clearly same. If Intervention & Comparator exist → must_pair=true. Include boolean "domain_relevant". JSON: {"chunks":[],"anchors":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[],"Population":[],"Context":[]},"mesh_terms":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[]},"must_pair":{"require_intervention_vs_comparator":false},"domain_relevant":true}""").strip()
-    content=pplx([{"role":"system","content":sys},{"role":"user","content":json.dumps({"query":norm(query)},ensure_ascii=False)}],CFG.pplx.model_plan,CFG.pplx.search_mode_plan,temp=0.0,maxtok=700)
+GOAL: minimal PubMed tokens (≤3 words). Group: Disease, Intervention, Comparator, Outcome, Population, Context.
+If Intervention & Comparator exist → must_pair=true. Include boolean "domain_relevant".
+JSON: {"chunks":[],"anchors":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[],"Population":[],"Context":[]},"mesh_terms":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[]},"must_pair":{"require_intervention_vs_comparator":false},"domain_relevant":true}""").strip()
+    content=pplx([{"role":"system","content":sys},
+                  {"role":"user","content":json.dumps({"query":norm(query)},ensure_ascii=False)}],
+                  CFG.pplx.model_plan,CFG.pplx.search_mode_plan,temp=0.0,maxtok=500)
     js=json_from_text(content)
-    if not js: 
+    if not js:
         toks=[t for t in tok(query) if t.lower() not in STOP]
         return {"chunks":list(dict.fromkeys(toks[:6])),
                 "anchors":{k:[] for k in ["Disease","Intervention","Comparator","Outcome","Population","Context"]},
                 "mesh_terms":{k:[] for k in ["Disease","Intervention","Comparator","Outcome"]},
                 "must_pair":{"require_intervention_vs_comparator":False},
                 "domain_relevant":True}
-    nl=lambda xs,n: list(dict.fromkeys([norm(str(v)).lower() for v in (xs or []) if v and len(str(v).split()) <= 3]))[:n]
+    nl=lambda xs,n: list(dict.fromkeys([norm(str(v)).lower() for v in (xs or []) if v and len(str(v).split())<=3]))[:n]
     js["chunks"]=nl(js.get("chunks",[]),6)
     for k in ["Disease","Intervention","Comparator","Outcome","Population","Context"]:
         js.setdefault("anchors",{}).setdefault(k,[]); js["anchors"][k]=nl(js["anchors"][k],8)
@@ -157,11 +210,11 @@ GOAL: minimal, precise PubMed units; fix minor typos; do NOT invent. Extract sho
     js["domain_relevant"]=bool(js.get("domain_relevant",True))
     return js
 
-# ================= boolean composer (adaptive strictness) =================
+# ================= boolean composer =================
 def _cluster(terms,k,thr):
-    items=list(dict.fromkeys([norm(t).lower() for t in terms if t and t.lower() not in STOP])); 
+    items=list(dict.fromkeys([norm(t).lower() for t in terms if t and t.lower() not in STOP]))
     if not items: return []
-    V=embed(items); 
+    V=embed(items)
     if V.shape[0]<=1: return [items]
     cents=[V[0]]; groups=[[items[0]]]
     for _ in range(1,min(k,len(items))):
@@ -183,8 +236,8 @@ def compose(plan, lo, hi, ex, qlen:int):
     A=plan.get("anchors",{}); dz,it,cp,oc,cx=A.get("Disease",[]),A.get("Intervention",[]),A.get("Comparator",[]),A.get("Outcome",[]),A.get("Context",[])
     long_query = qlen >= 50
     thr = CFG.boolean.long_sim_threshold if long_query else CFG.boolean.sim_threshold
-    k_dz, k_int, k_cmp, k_out, k_ctx = (3,3,3,2,2) if long_query else (2,2,2,2,1)
-    dzc, itc, cpc, occ, cxc = _cluster(dz,k_dz,thr), _cluster(it,k_int,thr), _cluster(cp,k_cmp,thr), _cluster(oc,k_out,thr), _cluster(cx,k_ctx,thr)
+    k_dz,k_int,k_cmp,k_out,k_ctx=(3,3,3,2,2) if long_query else (2,2,2,2,1)
+    dzc,itc,cpc,occ,cxc=_cluster(dz,k_dz,thr),_cluster(it,k_int,thr),_cluster(cp,k_cmp,thr),_cluster(oc,k_out,thr),_cluster(cx,k_ctx,thr)
     vs=[]
     if itc and cpc:
         inter_all=_block(sorted(set(it))); comp_all=_block(sorted(set(cp)))
@@ -193,19 +246,9 @@ def compose(plan, lo, hi, ex, qlen:int):
     broad=" AND ".join([x for x in [_block(dzc[0] if dzc else []),_block(itc[0] if itc else []),_block(cxc[0] if cxc else [])] if x]); vs.append({"label":"dz_inter_broad","query":_guards(broad or q_ta("clinical"),lo,hi,ex)})
     if not dz and not it and plan.get("chunks"):
         ch=[c for c in plan["chunks"] if c][:3]; fb=" AND ".join(q_ta(c) for c in ch) or q_ta("clinical"); vs.append({"label":"chunks_compact","query":_guards(fb,lo,hi,ex)})
-    if long_query:
-        dzo=(dzc[0] if dzc else [])[:CFG.boolean.max_terms_per_block]; ito=(itc[0] if itc else [])[:CFG.boolean.max_terms_per_block]
-        if dzo or ito: vs.append({"label":"or_dz_or_inter","query": "("+" OR ".join([q_ta(t) for t in (dzo+ito)])+")"})
-        if dz: vs.append({"label":"dz_only_or","query": _guards("("+" OR ".join(q_ta(t) for t in dz[:CFG.boolean.max_terms_per_block])+")", lo,hi,[])})
-        if it: vs.append({"label":"inter_only_or","query": _guards("("+" OR ".join(q_ta(t) for t in it[:CFG.boolean.max_terms_per_block])+")", lo,hi,[])})
-        if oc: vs.append({"label":"outcome_only_or","query": _guards("("+" OR ".join(q_ta(t) for t in oc[:CFG.boolean.max_terms_per_block])+")", lo,hi,[])})
-        ch=(plan.get("chunks") or [])[:4]
-        if ch: vs.append({"label":"chunks_or","query": "("+" OR ".join(q_ta(t) for t in ch)+")"})
-        tri=" AND ".join([x for x in [_block(dzc[0] if dzc else []), _block(itc[0] if itc else [])] if x])
-        if tri: vs.append({"label":"triad_dz_inter","query": _guards(tri, lo,hi,[])})
     return vs
 
-# ================= pubmed I/O =================
+# ================= PubMed I/O =================
 def _eutils(path,params,as_json):
     p={**params,"tool":CFG.pubmed.tool,"email":CFG.pubmed.email}
     if PUBMED_KEY: p["api_key"]=PUBMED_KEY
@@ -220,31 +263,42 @@ def efetch(ids):
     if not ids: return {}
     xml=_eutils("efetch.fcgi",{"db":"pubmed","retmode":"xml","rettype":"abstract","id":",".join(ids)},False); out={}
     for blk in re.findall(r"<PubmedArticle>.*?</PubmedArticle>",xml,flags=re.S):
-        m=re.search(r"<PMID[^>]*>(\d+)</PMID>",blk); 
+        m=re.search(r"<PMID[^>]*>(\d+)</PMID>",blk)
         if not m: continue
-        pid=m.group(1); abst=" ".join(re.findall(r"<AbstractText[^>]*>(.*?)</AbstractText>",blk,flags=re.S)); abst=norm(re.sub(r"<[^>]+>"," ",abst))
-        ptypes=[re.sub(r"<[^>]+>","",p).strip() for p in re.findall(r"<PublicationType>(.*?)</PublicationType>",blk)]; out[pid]={"abstract":abst,"pubtypes":ptypes}
+        pid=m.group(1)
+        abst=" ".join(re.findall(r"<AbstractText[^>]*>(.*?)</AbstractText>",blk,flags=re.S)); abst=norm(re.sub(r"<[^>]+>"," ",abst))
+        ptypes=[re.sub(r"<[^>]+>","",p).strip() for p in re.findall(r"<PublicationType>(.*?)</PublicationType>",blk)]
+        out[pid]={"abstract":abst,"pubtypes":ptypes}
     return out
 
 # ================= ranking =================
-@dataclass
-class Doc: pmid:str; title:str; journal:str; year:int; abstract:str; pubtypes:List[str]; scores:Dict[str,float]; from_label:str=""
+from dataclasses import dataclass as _dataclass
+@_dataclass
+class Doc:
+    pmid:str; title:str; journal:str; year:int; abstract:str; pubtypes:List[str]; scores:Dict[str,float]; from_label:str=""
+
 def bm25_scores_local(query,docs):
     tokenized=[tok(d.lower()) for d in docs]; bm=BM25Okapi(tokenized); return np.array(bm.get_scores(tok(query.lower())),dtype=np.float32)
-def bonus_score(pt): 
+
+def bonus_score(pt):
     p=[x.lower() for x in (pt or [])]; b=0.0
     if any("random" in x for x in p): b+=0.6
     if any(("meta" in x) or ("systematic" in x) for x in p): b+=0.7
     if any("guideline" in x for x in p): b+=0.3
     return b
+
 def mmr(qv,D,lam,k):
     if D.shape[0]==0: return []
     s=(D@qv.reshape(-1,1)).ravel(); sel=[int(np.argmax(s))]; rem=set(range(D.shape[0]))-set(sel); DD=D@D.T
-    while rem and len(sel)<k: 
+    while rem and len(sel)<k:
         best=max(rem,key=lambda i: lam*s[i]-(1-lam)*max(DD[i,j] for j in sel)); sel.append(best); rem.remove(best)
     return sel
+
 def retrieve(boolean,nl,label):
-    ids=esearch(boolean,CFG.pubmed.retmax_main)
+    try:
+        ids=esearch(boolean,CFG.pubmed.retmax_main)
+    except Exception:
+        return []
     if not ids: return []
     sm=esummary(ids); order,titles,meta=[],[],{}
     for pid in ids:
@@ -253,65 +307,90 @@ def retrieve(boolean,nl,label):
         jr=(e.get("fulljournalname") or e.get("source") or "").strip(); pd=e.get("pubdate",""); m=re.search(r"\b(19|20)\d{2}\b",pd); yr=int(m.group(0)) if m else 0
         order.append(pid); titles.append(ttl); meta[pid]={"title":ttl,"journal":jr,"year":yr}
     if not titles: return []
-    b=bm25_scores_local(nl,titles); idx=sorted(range(len(titles)),key=lambda i:-b[i])[:CFG.retrieval.topk_titles]; abs_map=efetch([order[i] for i in idx]); out=[]
+    b=bm25_scores_local(nl,titles); idx=sorted(range(len(titles)),key=lambda i:-b[i])[:CFG.retrieval.topk_titles]
+    try: abs_map=efetch([order[i] for i in idx])
+    except Exception: abs_map={}
+    out=[]
     for pid in [order[i] for i in idx]:
         m=meta[pid]; am=abs_map.get(pid,{})
         out.append(Doc(pid,m["title"],m["journal"],m["year"],am.get("abstract",""),am.get("pubtypes",[]),{"bm25_group":float(b[order.index(pid)])},label))
     return out
+
 def fuse_mmr(query,docs):
     if not docs: return []
-    texts=[(d.title+" "+d.abstract).strip() for d in docs]; bm=bm25_scores_local(query,texts); qv=embed([query])[0]; D=embed(texts)
-    cos=(D@qv.reshape(-1,1)).ravel().astype(np.float32); bon=np.array([bonus_score(d.pubtypes) for d in docs],dtype=np.float32)
-    fused=CFG.rank.w_cos*minmax(cos)+CFG.rank.w_bm25*minmax(bm)+CFG.rank.w_bonus*minmax(bon); top=min(CFG.rank.mmr_take,len(docs)); order=np.argsort(-fused)[:top]; Dtop=D[order]; dtop=[docs[i] for i in order]
+    texts=[(d.title+" "+(d.abstract or "")).strip() for d in docs]
+    qv=try_get_query_vec(query)
+    if qv is None:
+        qv=_EMB.encode([query],CFG.rank.embed_batch)[0]; cache_query_vec(query,qv)
+    D=_EMB.encode(texts,CFG.rank.embed_batch)
+    cos=(D@qv.reshape(-1,1)).ravel().astype(np.float32)
+    bon=np.array([bonus_score(d.pubtypes) for d in docs],dtype=np.float32)
+    fused=CFG.rank.w_cos*minmax(cos)+CFG.rank.w_bm25*minmax(bon)+CFG.rank.w_bonus*minmax(bon)
+    top=min(CFG.rank.mmr_take,len(docs)); order=np.argsort(-fused)[:top]; Dtop=D[order]; dtop=[docs[i] for i in order]
+    try:
+        for i,d in enumerate(dtop): cache_doc_vec(d.pmid,d.title,d.journal,d.year,d.abstract,Dtop[i])
+    except Exception: pass
     picks=mmr(qv,Dtop,CFG.rank.mmr_lambda,min(CFG.retrieval.final_take,top))
-    for i,d in enumerate(docs): d.scores={**(d.scores or {}),"bm25":float(bm[i]),"cos":float(cos[i]),"bonus":float(bon[i]),"hybrid":float(fused[i]),"fused_raw":float(fused[i])}
+    for i,d in enumerate(docs): d.scores={**(d.scores or {}),"cos":float(cos[i]),"bonus":float(bon[i]),"fused_raw":float(fused[i])}
     return [dtop[i] for i in picks]
 
-# ================= evidence + summary (ALWAYS TOP-5) =================
+# ================= evidence + summary =================
 def evidence_pack(docs, cap=5):
     chosen=docs[:cap]; idx2url={}; lines=[]
     for i,d in enumerate(chosen,1):
-        idx2url[i]=pmid_url(d.pmid); head=f"[{i}] PMID {d.pmid} ({d.year}) {d.journal} — {d.title} ({idx2url[i]})".strip(" —")
-        body=f"Abstract: {d.abstract[:CFG.summary.abstract_chars]}" if d.abstract else "Abstract: (not available)"; lines.append(f"{head}\n{body}")
+        idx2url[i]=pmid_url(d.pmid)
+        head=f"[{i}] PMID {d.pmid} ({d.year}) {d.journal} — {d.title} ({idx2url[i]})".strip(" —")
+        body=f"Abstract: {d.abstract[:CFG.summary.abstract_chars]}" if d.abstract else "Abstract: (not available)"
+        lines.append(f"{head}\n{body}")
     return "EVIDENCE PACK\n"+"\n\n".join(lines), idx2url
-def summarize(query,docs, exact_flag=False):
+
+def _role_flavor(role: Optional[str]) -> str:
+    r=(role or "").lower()
+    if r in ("doctor","clinician","physician","md"): return "Write clinically and concisely with effect sizes and guideline context; avoid advice."
+    if r in ("researcher","scientist"): return "Use a technical tone; emphasize design, endpoints, estimates, and limits."
+    return "Use clear, precise prose without bullets or markdown."
+
+def summarize(query,docs, exact_flag=False, role: Optional[str]=None):
     if not docs:
         return {"question":query,"answer":{"conclusion":"No eligible PubMed items found.","key_findings":[],"quality_and_limits":["Try broadening filters or removing exclusions."],"evidence_citations":[]}, "citation_links":{}}
     cap=CFG.summary.top_docs_for_pack
     pack,links=evidence_pack(docs, cap=cap)
-    flavor="If only one document is available, still answer concisely and cite [1]."
-    if exact_flag: flavor += " Treat the single paper as an exact match."
-    sys=("Use ONLY the EVIDENCE PACK; do not browse. Every factual sentence should include bracket citations like [1][2] when possible. Prefer RCTs/meta-analyses/guidelines. Respond with JSON only. "+flavor)
-    schema={"question":"string","answer":{"conclusion":"string","key_findings":"array","quality_and_limits":"array","evidence_citations":"array"}}
-    user=f"QUESTION\n{query}\n\n{pack}\n\nTASK\nReturn compact JSON exactly in this schema (no prose):\n{json.dumps(schema,indent=2)}"
+    flavor="Every factual sentence must include bracket citations like [1][2]. Do not use asterisks, dashes, bullets, or markdown anywhere. "
+    if exact_flag: flavor+="Treat the single paper as an exact match. "
+    flavor+=_role_flavor(role)
+    sys=("Use ONLY the EVIDENCE PACK; do not browse. Prefer RCTs/meta-analyses/guidelines. Respond with JSON only. "+flavor)
+    schema={"question":"string","answer":{"conclusion":"string","key_findings":"array","quality_and_limits":"array","evidence_citations":"array","evidence_notes":"object"}}
+    user=f"QUESTION\n{query}\n\n{pack}\n\nTASK\nReturn MINIFIED JSON exactly in this schema (no prose):\n{json.dumps(schema,indent=2)}\nIf a field is missing in EVIDENCE PACK, write 'not reported'. Ensure every claim has bracket citations."
     try:
-        content=pplx([{"role":"system","content":sys+" Return MINIFIED JSON only."},{"role":"user","content":user}],CFG.pplx.model_summary,CFG.pplx.search_mode_summary,temp=0.0,maxtok=800)
+        content=pplx([{"role":"system","content":sys+" Return MINIFIED JSON only."},{"role":"user","content":user}],CFG.pplx.model_summary,CFG.pplx.search_mode_summary,temp=0.0,maxtok=900)
         js=json_from_text(content)
         if not js:
-            content2=pplx([{"role":"system","content":sys},{"role":"user","content":user}],CFG.pplx.model_summary,CFG.pplx.search_mode_summary,temp=0.0,maxtok=800)
+            content2=pplx([{"role":"system","content":sys},{"role":"user","content":user}],CFG.pplx.model_summary,CFG.pplx.search_mode_summary,temp=0.0,maxtok=900)
             js=json_from_text(content2)
     except Exception:
         js=None
-    if js: js["citation_links"]=links; return js
+    if js:
+        js["citation_links"]=links
+        return js
     cites=list(range(1, min(cap, len(docs)) + 1))
-    return {"question":query,"answer":{"conclusion":"See synthesized findings from the evidence pack.","key_findings":[f"See items {cites} for key outcomes."],"quality_and_limits":["Automatic fallback summary; verify primary sources."],"evidence_citations":cites},"citation_links":links,"note":"Fallback summary used."}
+    return {"question":query,"answer":{"conclusion":"See synthesized findings from the evidence pack [1].","key_findings":[f"See items {cites} for key outcomes."],"quality_and_limits":["Automatic fallback summary; verify primary sources."],"evidence_citations":cites},"citation_links":links,"note":"Fallback summary used."}
 
 # ================= helpers =================
 def time_tags(q):
     ql=q.lower(); m_b=re.search(r"\bbetween\s+((?:19|20)\d{2})\s+(?:and|-|to)\s+((?:19|20)\d{2})\b",ql)
     if m_b: return m_b.group(1), m_b.group(2)
-    m_ge=re.search(r"\bsince\s+((?:19|20)\d{2})\b",ql); m_le=re.search(r"\bbefore\s+((?:19|20)\d{2})\b",ql); 
+    m_ge=re.search(r"\bsince\s+((?:19|20)\d{2})\b",ql); m_le=re.search(r"\bbefore\s+((?:19|20)\d{2})\b",ql)
     return (m_ge.group(1) if m_ge else "", m_le.group(1) if m_le else "")
 def parse_not(q):
-    out=[]; 
+    out=[]
     for kw in ("exclude","excluding","without","not"): out+=[norm(m.group(1)) for m in re.finditer(rf"\b{kw}\s+([^.;,]+)",q,flags=re.I)]
-    seen=set(); ret=[]
+    seen,setret=set(),[]
     for e in out:
         el=e.lower()
-        if el and el not in seen: seen.add(el); ret.append(e)
-    return ret[:6]
+        if el and el not in seen: seen.add(el); setret.append(e)
+    return setret[:6]
 def ultra_relaxed(q,lo,hi,ex):
-    base=" AND ".join(q_ta(t) for t in [t for t in tok(q) if t.lower() not in STOP][:4]) or q_ta("clinical"); 
+    base=" AND ".join(q_ta(t) for t in [t for t in tok(q) if t.lower() not in STOP][:4]) or q_ta("clinical")
     return _guards(base,lo,hi,ex)
 def widen_variants(plan,q,lo,hi,ex):
     A=plan.get("anchors",{})
@@ -325,101 +404,133 @@ def widen_variants(plan,q,lo,hi,ex):
     return chans
 
 # ================= pipeline =================
-def run_pipeline(query):
+def _guardrail_payload(chunks, lo, hi, ex, tried, reason: str = ""):
+    base = "We can’t search relevant keywords from our PubMed-backed database. Please try another query using healthcare or biomedical terminology."
+    msg = base if not reason else f"{base} {reason}".strip()
+    return {
+        "docs": [],
+        "summary": {"answer": {"conclusion": msg, "key_findings": [], "quality_and_limits": [], "evidence_citations": []},
+                    "citation_links": {}},
+        "plan": {"chunks": chunks},
+        "time_tags": [lo, hi],
+        "exclusions": ex,
+        "booleans": tried,
+        "timings": {"retrieve_ms": 0, "summarize_ms": 0},
+    }
+
+def run_pipeline(query, role: Optional[str] = None):
+    t0 = time.perf_counter()
     q=norm(query); lo,hi=time_tags(q); ex=parse_not(q)
-    plan=plan_tokens(q)
-    if not plan.get("domain_relevant",True): 
-        return {"error":"Query not in biomedical domain; cannot retrieve from PubMed."}
+
+    # Guardrail
+    guard = guardrail_domain(q)
+    if not guard.get("domain_relevant", False):
+        return _guardrail_payload([], lo, hi, ex, [], guard.get("reason",""))
+
+    # Planner
+    try:
+        plan=plan_tokens(q)
+    except Exception:
+        plan={"chunks":[t for t in tok(q) if t.lower() not in STOP][:4],"anchors":{},"domain_relevant":True}
+
+    if not plan.get("domain_relevant", True):
+        return _guardrail_payload(plan.get("chunks",[]), lo, hi, ex, [], "The query did not appear biomedical.")
+
     q_tokens=len(tok(q))
     variants=compose(plan,lo,hi,ex,qlen=q_tokens)
-    tried_booleans=[]  # expose which booleans we tried (for UI/debug)
-    merged={}
+    tried_booleans=[]; merged={}
+
     for v in variants:
         tried_booleans.append({"label":v["label"], "query":v["query"]})
-        if not esearch(v["query"],CFG.pubmed.retmax_probe): continue
-        for d in retrieve(v["query"],q,v["label"]): merged[d.pmid]=d
-        if len(merged)>=CFG.retrieval.topk_titles: break
+        try:
+            if not esearch(v["query"],CFG.pubmed.retmax_probe): continue
+            for d in retrieve(v["query"],q,v["label"]): merged[d.pmid]=d
+            if len(merged)>=CFG.retrieval.topk_titles: break
+        except Exception: continue
+
     exact_single = len(merged)==1
     if len(merged)<CFG.retrieval.min_final:
         for lv in widen_variants(plan,q,lo,hi,ex):
             tried_booleans.append({"label":lv["label"], "query":lv["query"]})
-            if not esearch(lv["query"],CFG.pubmed.retmax_probe): continue
-            for d in retrieve(lv["query"],q,lv["label"]): 
-                if d.pmid not in merged: merged[d.pmid]=d
-            if len(merged)>=CFG.retrieval.min_final: break
+            try:
+                if not esearch(lv["query"],CFG.pubmed.retmax_probe): continue
+                for d in retrieve(lv["query"],q,lv["label"]):
+                    if d.pmid not in merged: merged[d.pmid]=d
+                if len(merged)>=CFG.retrieval.min_final: break
+            except Exception: continue
+
     if not merged:
-        fb=ultra_relaxed(q,lo,hi,ex)
-        tried_booleans.append({"label":"fallback_compact","query":fb})
-        for d in retrieve(fb,q,"fallback_compact"): merged[d.pmid]=d
+        try:
+            fb=ultra_relaxed(q,lo,hi,ex); tried_booleans.append({"label":"fallback_compact","query":fb})
+            for d in retrieve(fb,q,"fallback_compact"): merged[d.pmid]=d
+        except Exception: pass
+
     all_docs=list(merged.values()); final_docs=fuse_mmr(q,all_docs) if all_docs else []
     used_docs = final_docs if final_docs else all_docs
+
+    t_retrieve_end = time.perf_counter()
+
+    if not used_docs:
+        out = _guardrail_payload(plan.get("chunks",[]), lo, hi, ex, tried_booleans, "No PubMed items were found.")
+        out["timings"] = {"retrieve_ms": int((t_retrieve_end - t0)*1000), "summarize_ms": 0}
+        return out
+
+    t_sum_start = time.perf_counter()
+    summary_obj = summarize(q, used_docs, exact_flag=exact_single, role=role)
+    t_sum_end = time.perf_counter()
+
     return {
         "docs":[{**asdict(d), "url": pmid_url(d.pmid)} for d in used_docs],
-        "summary": summarize(q, used_docs, exact_flag=exact_single),
+        "summary": summary_obj,
         "plan": {"chunks": plan.get("chunks", [])},
         "time_tags": [lo,hi],
         "exclusions": ex,
-        "booleans": tried_booleans
+        "booleans": tried_booleans,
+        "timings": {
+            "retrieve_ms": int((t_retrieve_end - t0)*1000),
+            "summarize_ms": int((t_sum_end - t_sum_start)*1000),
+        },
     }
 
-# ================= FE compatibility shim =================
+# ================= FE compatibility shim (unchanged) =================
 def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = False) -> Tuple[str, Dict[str, Any]]:
-    """
-    Returns (assistant_text, right_pane) for /ask.
-    - assistant_text now includes a **Citations** section with direct links.
-    - right_pane.results contains docs with URLs (shown in your right panel).
-    """
-    pipe = run_pipeline(question)
-    summary = pipe.get("summary") or {}
-    docs    = pipe.get("docs") or []
-    heading = (role or "Answer").replace("_"," ").title()
+    pipe = run_pipeline(question, role=role)
+    summary = pipe.get("summary") or {}; docs = pipe.get("docs") or []
 
-    # build assistant message
+    def _list_lines(items: List[str]) -> List[str]:
+        out=[]
+        for i,x in enumerate(items or [], start=1):
+            if x: out.append(f"{i}. {x.strip()}")
+        return out
+
     if isinstance(summary, dict) and "answer" in summary:
         a = summary["answer"] or {}
-        conclusion = a.get("conclusion") or ""
-        kf = a.get("key_findings") or []
-        ql = a.get("quality_and_limits") or []
+        conclusion = (a.get("conclusion") or "").strip()
+        kf = _list_lines(a.get("key_findings") or [])
+        ql = _list_lines(a.get("quality_and_limits") or [])
         cites = a.get("evidence_citations") or []
-        linkmap = {str(k):v for k,v in (summary.get("citation_links") or {}).items()}
+        links = {str(k):v for k,v in (summary.get("citation_links") or {}).items()}
 
-        lines = [f"### {heading}", conclusion.strip()]
-        if kf:
-            lines.append("\n**Key findings**")
-            for item in kf: lines.append(f"- {item}")
-        if ql:
-            lines.append("\n**Quality & limitations**")
-            for item in ql: lines.append(f"- {item}")
-
+        lines = []
+        if conclusion: lines += [conclusion, ""]
+        if kf: lines += ["Key findings:", *kf, ""]
+        if ql: lines += ["Quality and limitations:", *ql, ""]
         if cites:
-            lines.append("\n**Citations**")
-            # map [n] → title + url using the evidence-pack order (1..cap)
+            lines.append("Citations:")
             for n in cites:
-                title = None; url = linkmap.get(str(n))
-                if 1 <= int(n) <= len(docs):
-                    title = docs[int(n)-1].get("title") or title
-                    url = url or docs[int(n)-1].get("url")
-                # fallbacks if title missing
-                disp = title or f"Reference {n}"
-                u = url or ""
-                if u: lines.append(f"[{n}] {disp} — {u}")
-                else: lines.append(f"[{n}] {disp}")
-        assistant_text = "\n".join([s for s in lines if s and s.strip()])
+                try: idx=int(n)
+                except Exception: continue
+                title = docs[idx-1]["title"] if 1<=idx<=len(docs) else f"Reference {idx}"
+                url = links.get(str(idx)) or (docs[idx-1].get("url") if 1<=idx<=len(docs) else "")
+                lines.append(f"{idx}. {title} {('- ' + url) if url else ''}")
+        assistant_text = "\n".join([s for s in lines if s is not None])
     else:
-        assistant_text = f"### {heading}\n(no summary generated)"
+        assistant_text = "No summary generated."
 
-    # right-pane payload (docs + booleans + plan/tags)
-    results = []
-    for d in docs:
-        results.append({
-            "pmid": d.get("pmid"),
-            "title": d.get("title"),
-            "journal": d.get("journal"),
-            "year": d.get("year"),
-            "url": d.get("url"),
-            "score": (d.get("scores") or {}).get("fused_raw") if d.get("scores") else None,
-            "abstract": d.get("abstract"),
-        })
+    results = [{"pmid": d.get("pmid"), "title": d.get("title"), "journal": d.get("journal"),
+                "year": d.get("year"), "url": d.get("url"),
+                "score": (d.get("scores") or {}).get("fused_raw") if d.get("scores") else None,
+                "abstract": d.get("abstract")} for d in docs]
 
     right_pane = {
         "results": results,
@@ -428,6 +539,6 @@ def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = 
                  "time_tags": pipe.get("time_tags", []),
                  "exclusions": pipe.get("exclusions", [])},
         "overview": None,
-        # evidence list could be added if you want, but right pane already shows results with links
+        "timings": pipe.get("timings") or {"retrieve_ms": 0, "summarize_ms": 0},
     }
     return assistant_text, right_pane

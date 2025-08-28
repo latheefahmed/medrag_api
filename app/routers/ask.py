@@ -13,25 +13,24 @@ from app.db import (
     get_session_by_id,
     create_session,
     update_session,
+    create_log,
 )
 
-# Import the whole module so we can support BOTH run_rag_pipeline(...) and run_pipeline(...)
 import app.services.rag as rag
 
 router = APIRouter(prefix="/ask", tags=["ask"])
 
 # --------- Accept both old/new FE payloads gracefully ----------
 class AskBody(BaseModel):
-    session_id: Optional[str] = None  # new style
-    id: Optional[str] = None          # old style
-    q: Optional[str] = None           # new style (preferred by FE hook)
-    question: Optional[str] = None    # legacy
-    text: Optional[str] = None        # legacy
-    max_tokens: Optional[int] = 512   # ignored by backend (compat only)
-    role_override: Optional[str] = None  # optional (rare)
+    session_id: Optional[str] = None
+    id: Optional[str] = None
+    q: Optional[str] = None
+    question: Optional[str] = None
+    text: Optional[str] = None
+    max_tokens: Optional[int] = 512
+    role_override: Optional[str] = None
 
 
-# --------- Helpers ----------
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -45,14 +44,11 @@ def _iso_to_ms(s: Optional[str]) -> int:
         return _now_ms()
 
 def _mk_references_from_rightpane(rp: Dict[str, Any] | None) -> List[Dict[str, Any]]:
-    """
-    Normalize rightPane.results -> message.references[]
-    """
     if not rp:
         return []
     results = rp.get("results") or rp.get("final_docs") or rp.get("documents") or []
     out: List[Dict[str, Any]] = []
-    for d in results[:20]:  # cap to keep chat payload small
+    for d in results[:20]:
         pmid = str(d.get("pmid") or d.get("id") or "").strip() or None
         url = d.get("url") or (f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else None)
         out.append({
@@ -68,7 +64,6 @@ def _mk_references_from_rightpane(rp: Dict[str, Any] | None) -> List[Dict[str, A
 
 
 def _present_session(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """Map Cosmos snake_case doc → FE camelCase session (not used as /ask response, but handy for debugging)."""
     return {
         "id": doc["id"],
         "title": doc.get("title") or "Untitled",
@@ -79,48 +74,59 @@ def _present_session(doc: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _compute_answer(question: str, role: Optional[str]) -> tuple[str, Dict[str, Any]]:
+def _build_response_from_pipe(pipe: Dict[str, Any], role: Optional[str]) -> tuple[str, Dict[str, Any], Dict[str,int], int]:
     """
-    Call the available RAG entrypoint:
-      - prefer rag.run_rag_pipeline(q, role, verbose=False) -> (assistant_text, right_pane)
-      - else rag.run_pipeline(q) -> we adapt its output into the same pair
+    Build (assistant_text, right_pane, timings, n_results) from rag.run_pipeline output.
+    The assistant_text is PLAIN TEXT (no markdown symbols or bullets).
     """
-    # Case 1: modern wrapper exists
-    if hasattr(rag, "run_rag_pipeline"):
-        return rag.run_rag_pipeline(question, role=role, verbose=False)
-
-    # Case 2: only run_pipeline exists – adapt to (assistant_text, right_pane)
-    pipe = rag.run_pipeline(question)
-
-    # Build assistant text from structured summary if present
     summary = pipe.get("summary") or {}
-    heading = (role or "Answer").replace("_", " ").title()
+    docs = pipe.get("docs") or []
+    timings = pipe.get("timings") or {"retrieve_ms": 0, "summarize_ms": 0}
+    n_results = len(docs)
+
+    # Assistant text (plain)
     if isinstance(summary, dict) and "answer" in summary:
         a = summary.get("answer") or {}
-        conclusion = a.get("conclusion") or ""
-        kf = a.get("key_findings") or []
-        ql = a.get("quality_and_limits") or []
+        conclusion = (a.get("conclusion") or "").strip()
+        kf = [s for s in (a.get("key_findings") or []) if s]
+        ql = [s for s in (a.get("quality_and_limits") or []) if s]
         cites = a.get("evidence_citations") or []
-        lines = [f"### {heading}", conclusion.strip()]
-        if kf:
-            lines.append("\n**Key findings**")
-            for item in kf:
-                lines.append(f"- {item}")
-        if ql:
-            lines.append("\n**Quality & limitations**")
-            for item in ql:
-                lines.append(f"- {item}")
-        if cites:
-            lines.append("\n**Citations**")
-            lines.append(", ".join([f"[{c}]" for c in cites]))
-        assistant_text = "\n".join([s for s in lines if s and s.strip()])
-    else:
-        assistant_text = f"### {heading}\n(no summary generated)"
 
-    # Build rightPane-like object
-    final_docs = pipe.get("final_docs") or pipe.get("docs") or []
+        lines: List[str] = []
+        if conclusion:
+            lines.append(conclusion)
+        if kf:
+            lines.append("")  # blank line
+            lines.append("Key findings:")
+            for i, item in enumerate(kf, 1):
+                lines.append(f"{i}. {item}")
+        if ql:
+            lines.append("")
+            lines.append("Quality and limitations:")
+            for i, item in enumerate(ql, 1):
+                lines.append(f"{i}. {item}")
+        if cites:
+            lines.append("")
+            lines.append("Citations:")
+            # include title + link for each cited index if we have it
+            links = {str(k): v for k, v in (summary.get("citation_links") or {}).items()}
+            for n in cites:
+                try:
+                    idx = int(n)
+                except Exception:
+                    continue
+                title = docs[idx-1]["title"] if 1 <= idx <= len(docs) else f"Reference {idx}"
+                url = links.get(str(idx)) or (docs[idx-1].get("url") if 1 <= idx <= len(docs) else "")
+                lines.append(f"[{idx}] {title}{(' - ' + url) if url else ''}")
+
+        assistant_text = "\n".join([s for s in lines if s is not None])
+    else:
+        assistant_text = "No summary generated."
+
+    # Right pane (unchanged shape)
     def pmid_url(pmid: str | None) -> Optional[str]:
         return f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else None
+
     results = [{
         "pmid": d.get("pmid"),
         "title": d.get("title"),
@@ -129,9 +135,10 @@ def _compute_answer(question: str, role: Optional[str]) -> tuple[str, Dict[str, 
         "url": d.get("url") or pmid_url(d.get("pmid")),
         "score": (d.get("scores") or {}).get("fused_raw") if d.get("scores") else d.get("score"),
         "abstract": d.get("abstract"),
-    } for d in final_docs]
+    } for d in docs]
 
-    booleans = [{"group": b.get("chunk",""), "query": b.get("boolean",""), "note": b.get("note")} for b in (pipe.get("buckets") or [])]
+    booleans = [{"group": b.get("label",""), "query": b.get("query",""), "note": b.get("note")} for b in (pipe.get("booleans") or [])]
+
     overview = None
     if isinstance(summary, dict) and "answer" in summary:
         overview = {
@@ -139,6 +146,7 @@ def _compute_answer(question: str, role: Optional[str]) -> tuple[str, Dict[str, 
             "key_findings": (summary["answer"] or {}).get("key_findings", []),
             "quality_and_limits": (summary["answer"] or {}).get("quality_and_limits", []),
         }
+
     right_pane = {
         "results": results,
         "booleans": booleans,
@@ -148,27 +156,19 @@ def _compute_answer(question: str, role: Optional[str]) -> tuple[str, Dict[str, 
             "exclusions": pipe.get("exclusions", []),
         },
         "overview": overview,
+        "timings": timings,
     }
-    return assistant_text, right_pane
+    return assistant_text, right_pane, timings, n_results
 
 
-# --------- Route ----------
 @router.post("")
 async def ask(body: AskBody, user=Depends(get_current_user)):
-    """
-    Runs RAG, appends messages (including references[] on AI msg), saves rightPane,
-    and returns a compact payload the FE hook expects:
-
-      { session_id, message: {id, role, content, ts, references[]}, rightPane }
-    """
-    # ---- auth/user ----
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     user_id = user.get("user_id") or user.get("id") or user.get("email")
     if not user_id:
         raise HTTPException(status_code=400, detail="Missing user_id")
 
-    # ---- payload normalization ----
     session_id = body.session_id or body.id or str(uuid4())
     question = (body.q or body.question or body.text or "").strip()
     if not question:
@@ -176,7 +176,7 @@ async def ask(body: AskBody, user=Depends(get_current_user)):
 
     role = (body.role_override or user.get("role") or "").strip() or None
 
-    # ---- fetch or create session ----
+    # ensure session
     sess = get_session_by_id(session_id, user_id)
     if not sess:
         sess = create_session({
@@ -187,26 +187,22 @@ async def ask(body: AskBody, user=Depends(get_current_user)):
             "meta": {},
         })
 
-    # ---- append user message (server-side canonical) ----
-    user_msg = {
-        "id": str(uuid4()),
-        "role": "user",
-        "content": question,
-        "ts": _now_ms(),
-    }
+    # append user msg
+    user_msg = {"id": str(uuid4()), "role": "user", "content": question, "ts": _now_ms()}
     messages: List[Dict[str, Any]] = (sess.get("messages") or []) + [user_msg]
 
-    # ---- run pipeline ----
+    # run RAG (pipeline; we want timings)
     try:
-        assistant_text, right_pane = _compute_answer(question, role=role)
+        pipe = rag.run_pipeline(question, role=role)
+        assistant_text, right_pane, timings, n_results = _build_response_from_pipe(pipe, role)
     except Exception as e:
         assistant_text = f"(pipeline error) {str(e)[:400]}"
-        right_pane = {"results": [], "booleans": [], "plan": {"chunks": [], "time_tags": [], "exclusions": []}}
+        right_pane = {"results": [], "booleans": [], "plan": {"chunks": [], "time_tags": [], "exclusions": []}, "timings": {"retrieve_ms": 0, "summarize_ms": 0}}
+        timings = {"retrieve_ms": 0, "summarize_ms": 0}
+        n_results = 0
 
-    # ---- build references from rightPane ----
     references = _mk_references_from_rightpane(right_pane)
 
-    # ---- append assistant message (with references) ----
     assistant_msg = {
         "id": str(uuid4()),
         "role": "assistant",
@@ -216,23 +212,28 @@ async def ask(body: AskBody, user=Depends(get_current_user)):
     }
     messages.append(assistant_msg)
 
-    # ---- persist session ----
-    patch = {
-        "messages": messages,
-        "meta": sess.get("meta") or {},
-        "rightPane": right_pane,  # FE reads this for the right pane
-    }
+    # persist session
+    patch = {"messages": messages, "meta": sess.get("meta") or {}, "rightPane": right_pane}
     updated = update_session(session_id, user_id, patch)
     if not updated:
-        # Soft fallback so FE still renders
         updated = dict(sess)
         updated["messages"] = messages
         updated["rightPane"] = right_pane
         updated["updated_at"] = datetime.utcnow().isoformat()
 
-    # ---- return compact FE payload ----
-    return {
-        "session_id": session_id,
-        "message": assistant_msg,
-        "rightPane": right_pane,
-    }
+    # ---- LOG ROW ----
+    try:
+        create_log({
+            "user_id": user_id,
+            "session_id": session_id,
+            "query": question,
+            "response": assistant_text,
+            "fetch_ms": int(timings.get("retrieve_ms", 0)),
+            "summarize_ms": int(timings.get("summarize_ms", 0)),
+            "n_results": int(n_results),
+            "ts": datetime.utcnow().isoformat(),
+        })
+    except Exception as e:
+        print(f"[LOGS] failed to write log: {e!r}")
+
+    return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane}

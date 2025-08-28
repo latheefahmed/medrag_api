@@ -1,7 +1,7 @@
 # --- API & framework ---
 fastapi>=0.110
 uvicorn[standard]>=0.27
-gunicorn>=21.2          # optional on Windows; used for Linux deploys
+gunicorn>=21.2
 python-dotenv>=1.0
 
 # --- Auth & security ---
@@ -24,7 +24,8 @@ numpy>=1.26
 llama-index>=0.10.30
 llama-index-embeddings-huggingface>=0.1.4
 sentence-transformers>=2.6
-
-# PyTorch is required by sentence-transformers/HF embeddings.
-# This generic spec should pull a compatible CPU wheel for Py3.12 on Windows.
 torch>=2.2
+
+# --- Vector DB cache (best-effort) ---
+qdrant-client>=1.8
+

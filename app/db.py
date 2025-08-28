@@ -13,7 +13,8 @@ load_dotenv()
 # ---- Config / Defaults ----
 DEFAULT_DB = os.getenv("COSMOS_DB", "medrag")
 USERS_CONTAINER = os.getenv("COSMOS_USERS_CONTAINER", "users")
-SESS_CONTAINER = os.getenv("COSMOS_SESSIONS_CONTAINER", "sessions")
+SESS_CONTAINER  = os.getenv("COSMOS_SESSIONS_CONTAINER", "sessions")
+LOGS_CONTAINER  = os.getenv("COSMOS_LOGS_CONTAINER", "logs")
 
 
 def _env_ok() -> Tuple[bool, str, str, str]:
@@ -22,8 +23,6 @@ def _env_ok() -> Tuple[bool, str, str, str]:
     db_name = (os.getenv("COSMOS_DB") or DEFAULT_DB).strip()
     return bool(url) and bool(key), url, key, db_name
 
-
-# ============== Low-level handles (client / db / containers) =================
 
 @lru_cache()
 def _handles():
@@ -39,117 +38,97 @@ def _handles():
     except exceptions.CosmosResourceExistsError:
         db = client.get_database_client(db_name)
 
-    # users (prefer pk=/email)
+    # users (pk=/email)
     try:
         users = db.create_container_if_not_exists(
-            id=USERS_CONTAINER,
-            partition_key=PartitionKey(path="/email"),
+            id=USERS_CONTAINER, partition_key=PartitionKey(path="/email"),
         )
     except exceptions.CosmosResourceExistsError:
         users = db.get_container_client(USERS_CONTAINER)
 
-    # sessions (prefer pk=/user_id)
+    # sessions (pk=/user_id)
     try:
         sessions = db.create_container_if_not_exists(
-            id=SESS_CONTAINER,
-            partition_key=PartitionKey(path="/user_id"),
+            id=SESS_CONTAINER, partition_key=PartitionKey(path="/user_id"),
         )
     except exceptions.CosmosResourceExistsError:
         sessions = db.get_container_client(SESS_CONTAINER)
 
-    return client, db, users, sessions
+    # logs (pk=/user_id)
+    try:
+        logs = db.create_container_if_not_exists(
+            id=LOGS_CONTAINER, partition_key=PartitionKey(path="/user_id"),
+        )
+    except exceptions.CosmosResourceExistsError:
+        logs = db.get_container_client(LOGS_CONTAINER)
+
+    return client, db, users, sessions, logs
 
 
-# Public helpers so routers can import them
+# ---------- Exposed handles ----------
 @lru_cache()
 def get_client() -> CosmosClient:
-    client, _, _, _ = _handles()
+    client, *_ = _handles()
     return client
-
 
 @lru_cache()
 def get_db():
-    _, db, _, _ = _handles()
+    _, db, *_ = _handles()
     return db
 
-
 def get_container(name: str):
-    """
-    Return a Cosmos container client by name. Known names ('users', 'sessions')
-    use the pre-created handles; unknown names are created if missing with pk=/id.
-    """
-    client, db, users, sessions = _handles()
-    if name in (USERS_CONTAINER, "users"):
-        return users
-    if name in (SESS_CONTAINER, "sessions"):
-        return sessions
-    # Generic container fallback (pk=/id)
+    client, db, users, sessions, logs = _handles()
+    if name in (USERS_CONTAINER, "users"):   return users
+    if name in (SESS_CONTAINER,  "sessions"): return sessions
+    if name in (LOGS_CONTAINER,  "logs"):     return logs
     try:
         return db.create_container_if_not_exists(id=name, partition_key=PartitionKey(path="/id"))
     except exceptions.CosmosResourceExistsError:
         return db.get_container_client(name)
 
-
-def get_users_container():
-    _, _, users, _ = _handles()
-    return users
-
-
-def get_sessions_container():
-    _, _, _, sessions = _handles()
-    return sessions
+def get_users_container():    return _handles()[2]
+def get_sessions_container(): return _handles()[3]
+def get_logs_container():     return _handles()[4]
 
 
 def _container_pk_path(container) -> str:
-    """Return the container's partition key path (e.g., '/email', '/user_id', '/id')."""
     props = container.read()
     pk = props.get("partitionKey") or {}
     paths = pk.get("paths") or []
     return paths[0] if paths else "/id"
 
 
-# ---------- Cosmos compatibility shims (handle SDKs that reject partition_key kw) ----------
+# ---------- Cosmos wrappers ----------
 def _safe_create_item(container, body, pk_value):
     try:
         return container.create_item(body, partition_key=pk_value)
     except TypeError:
-        # Older/mismatched azure-core may reject the kw; retry without it.
         return container.create_item(body)
-
 
 def _safe_read_item(container, item_id, pk_value):
     try:
-        # Normal fast point-read
         return container.read_item(item=item_id, partition_key=pk_value)
     except exceptions.CosmosResourceNotFoundError:
-        # Missing doc is normal; report "not found" to caller
         return None
     except TypeError:
-        # Fallback: cross-partition query by id (SDK rejected the kw)
-        items = list(
-            container.query_items(
-                query="SELECT * FROM c WHERE c.id = @id",
-                parameters=[{"name": "@id", "value": item_id}],
-                enable_cross_partition_query=True,
-            )
-        )
+        items = list(container.query_items(
+            query="SELECT * FROM c WHERE c.id = @id",
+            parameters=[{"name": "@id", "value": item_id}],
+            enable_cross_partition_query=True,
+        ))
         return items[0] if items else None
-
 
 def _safe_replace_item(container, item_id, body, pk_value):
     try:
         return container.replace_item(item=item_id, body=body, partition_key=pk_value)
     except TypeError:
-        # Fallback: upsert as best-effort replace
         return container.upsert_item(body)
-
 
 def _safe_delete_item(container, item_id, pk_value):
     try:
         container.delete_item(item=item_id, partition_key=pk_value)
         return True
     except TypeError:
-        # Soft-delete fallback if delete needs pk and SDK refuses kw
         doc = _safe_read_item(container, item_id, pk_value)
         if not doc:
             return False
@@ -159,9 +138,6 @@ def _safe_delete_item(container, item_id, pk_value):
 
 
 def ensure_cosmos() -> Dict[str, Any]:
-    """
-    Returns a dict with environment + container PK info to help with health checks.
-    """
     info: Dict[str, Any] = {
         "env": {
             "has_url": bool(os.getenv("COSMOS_URL")),
@@ -170,12 +146,14 @@ def ensure_cosmos() -> Dict[str, Any]:
         },
         "users_pk": None,
         "sessions_pk": None,
+        "logs_pk": None,
         "ok": False,
     }
     try:
-        _, _, users, sessions = _handles()
-        info["users_pk"] = _container_pk_path(users)
+        _, _, users, sessions, logs = _handles()
+        info["users_pk"]    = _container_pk_path(users)
         info["sessions_pk"] = _container_pk_path(sessions)
+        info["logs_pk"]     = _container_pk_path(logs)
         info["ok"] = True
     except Exception as e:
         info["error"] = str(e)
@@ -183,7 +161,6 @@ def ensure_cosmos() -> Dict[str, Any]:
 
 
 # ============================ Users ============================
-
 def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     if not email:
         return None
@@ -192,19 +169,15 @@ def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     users_pk = _container_pk_path(users)
     pk_value = email if users_pk in ("/email", "/id") else email
 
-    # Prefer fast point read by id=email (we enforce id=email on writes)
     doc = _safe_read_item(users, email, pk_value)
     if doc:
         return doc
 
-    # Secondary query by email (in case of legacy docs)
-    items = list(
-        users.query_items(
-            query="SELECT * FROM c WHERE c.email = @e",
-            parameters=[{"name": "@e", "value": email}],
-            enable_cross_partition_query=True,
-        )
-    )
+    items = list(users.query_items(
+        query="SELECT * FROM c WHERE c.email = @e",
+        parameters=[{"name": "@e", "value": email}],
+        enable_cross_partition_query=True,
+    ))
     return items[0] if items else None
 
 
@@ -218,6 +191,7 @@ def create_user(user: Dict[str, Any]) -> Dict[str, Any]:
     body["id"] = email
     body["email"] = email
     body.setdefault("role", "student")
+    body.setdefault("verified", False)
     body.setdefault("created_at", datetime.now(timezone.utc).isoformat())
 
     users_pk = _container_pk_path(users)
@@ -225,8 +199,32 @@ def create_user(user: Dict[str, Any]) -> Dict[str, Any]:
     return _safe_create_item(users, body, pk_value)
 
 
-# ============================ Sessions ============================
+def update_user(email: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    doc = get_user_by_email(email)
+    if not doc:
+        return None
+    users = get_users_container()
+    users_pk = _container_pk_path(users)
+    doc.update(patch or {})
+    pk_value = doc["email"] if users_pk == "/email" else doc["id"]
+    return _safe_replace_item(users, doc["id"], doc, pk_value)
 
+
+def list_users(limit: int = 200) -> List[Dict[str, Any]]:
+    users = get_users_container()
+    q = "SELECT c.id, c.email, c.role, c.verified, c.created_at FROM c ORDER BY c.created_at DESC"
+    items = list(users.query_items(query=q, enable_cross_partition_query=True, max_item_count=limit))
+    return items[:limit]
+
+
+def list_sessions_all(limit: int = 200) -> List[Dict[str, Any]]:
+    sessions = get_sessions_container()
+    q = "SELECT c.id, c.user_id, c.title, c.updated_at FROM c ORDER BY c.updated_at DESC"
+    items = list(sessions.query_items(query=q, enable_cross_partition_query=True, max_item_count=limit))
+    return items[:limit]
+
+
+# ============================ Sessions ============================
 def create_session(sess: Dict[str, Any]) -> Dict[str, Any]:
     sessions = get_sessions_container()
     user_id = (sess.get("user_id") or "").strip()
@@ -258,27 +256,22 @@ def get_session_by_id(session_id: str, user_id: str) -> Optional[Dict[str, Any]]
     if doc:
         return doc
 
-    # Fallback query by both fields
-    items = list(
-        sessions.query_items(
-            query="SELECT * FROM c WHERE c.id = @id AND c.user_id = @u",
-            parameters=[{"name": "@id", "value": session_id}, {"name": "@u", "value": user_id}],
-            enable_cross_partition_query=True,
-        )
-    )
+    items = list(sessions.query_items(
+        query="SELECT * FROM c WHERE c.id = @id AND c.user_id = @u",
+        parameters=[{"name": "@id", "value": session_id}, {"name": "@u", "value": user_id}],
+        enable_cross_partition_query=True,
+    ))
     return items[0] if items else None
 
 
 def list_sessions_for_user(user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
     sessions = get_sessions_container()
-    items = list(
-        sessions.query_items(
-            query="SELECT * FROM c WHERE c.user_id = @u ORDER BY c.updated_at DESC",
-            parameters=[{"name": "@u", "value": user_id}],
-            enable_cross_partition_query=True,
-            max_item_count=limit,
-        )
-    )
+    items = list(sessions.query_items(
+        query="SELECT * FROM c WHERE c.user_id = @u ORDER BY c.updated_at DESC",
+        parameters=[{"name": "@u", "value": user_id}],
+        enable_cross_partition_query=True,
+        max_item_count=limit,
+    ))
     return items[:limit]
 
 
@@ -322,3 +315,42 @@ def upsert_session(session_id: str, user_id: str, patch: dict | None = None):
             "messages": patch.get("messages", []),
             "meta": patch.get("meta", {}),
         })
+
+
+# ============================ Logs ============================
+def create_log(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Stores a Chat log row:
+      { id, user_id, session_id, query, response, fetch_ms, summarize_ms, n_results, ts }
+    Partition key: /user_id
+    """
+    logs = get_logs_container()
+    user_id = (entry.get("user_id") or "").strip()
+    if not user_id:
+        raise ValueError("create_log: 'user_id' required")
+
+    body = {
+        "id": entry.get("id") or str(uuid4()),
+        "user_id": user_id,
+        "session_id": entry.get("session_id") or "",
+        "query": entry.get("query") or "",
+        "response": (entry.get("response") or "")[:16000],  # trim to keep doc small
+        "fetch_ms": int(entry.get("fetch_ms") or 0),
+        "summarize_ms": int(entry.get("summarize_ms") or 0),
+        "n_results": int(entry.get("n_results") or 0),
+        "ts": entry.get("ts") or datetime.now(timezone.utc).isoformat(),
+    }
+    logs_pk = _container_pk_path(logs)
+    pk_value = user_id if logs_pk == "/user_id" else body["id"]
+    return _safe_create_item(logs, body, pk_value)
+
+
+def list_logs_for_user(user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+    logs = get_logs_container()
+    items = list(logs.query_items(
+        query="SELECT * FROM c WHERE c.user_id = @u ORDER BY c.ts DESC",
+        parameters=[{"name": "@u", "value": user_id}],
+        enable_cross_partition_query=True,
+        max_item_count=limit,
+    ))
+    return items[:limit]
