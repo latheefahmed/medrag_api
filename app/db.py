@@ -354,3 +354,24 @@ def list_logs_for_user(user_id: str, limit: int = 200) -> List[Dict[str, Any]]:
         max_item_count=limit,
     ))
     return items[:limit]
+
+def write_chat_log(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Accepts the fields used by /ask and maps them to create_log’s schema.
+    - retrieval_ms -> fetch_ms
+    - summary_ms   -> summarize_ms
+    - refs         -> n_results
+    - answer_preview -> response
+    Everything else is passed through.
+    """
+    # normalize known keys without losing anything else
+    e = dict(entry or {})
+    if "retrieval_ms" in e and "fetch_ms" not in e:
+        e["fetch_ms"] = int(e.get("retrieval_ms") or 0)
+    if "summary_ms" in e and "summarize_ms" not in e:
+        e["summarize_ms"] = int(e.get("summary_ms") or 0)
+    if "refs" in e and "n_results" not in e:
+        e["n_results"] = int(e.get("refs") or 0)
+    if "answer_preview" in e and "response" not in e:
+        e["response"] = str(e.get("answer_preview") or "")[:16000]
+    return create_log(e)
