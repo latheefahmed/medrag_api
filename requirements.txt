@@ -25,10 +25,12 @@ llama-index==0.10.30
 llama-index-embeddings-huggingface==0.1.4
 sentence-transformers==2.6.1
 
-# --- Torch (CPU) ---
-torch==2.2.2
+# --- Torch (CPU) ---  # >=2.6 to satisfy transformers' torch.load guard
+torch==2.8.0
+safetensors>=0.4.5
 
 # --- Vector DB cache (optional) ---
 qdrant-client==1.9.1
 
+# --- Settings (Pydantic v2 helpers) ---
 pydantic-settings>=2.5,<3
