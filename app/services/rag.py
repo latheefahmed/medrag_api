@@ -66,7 +66,7 @@ class RetrievalCfg:
 class SummaryCfg:
     top_docs_for_pack: int = 5
     abstract_chars: int = 650
-    prior_docs_for_pack: int = 3   # carry a few prior docs
+    prior_docs_for_pack: int = 3   # new: carry a few prior docs
 
 @dataclass
 class BooleanCfg:
@@ -434,7 +434,7 @@ def fuse_mmr(query, docs):
         d.scores = {**(d.scores or {}), "cos": float(cos[i]), "bonus": float(bon[i]), "fused_raw": float(fused[i])}
     return [dtop[i] for i in picks]
 
-# ==================== history/context ====================
+# ==================== history/context (NEW) ====================
 @dataclass
 class ResolvedContext:
     follow_up: bool = False
@@ -445,6 +445,7 @@ class ResolvedContext:
 
 def _intent_fallback(query: str, recent_msgs: List[Dict[str,str]]) -> ResolvedContext:
     ql = query.lower().strip()
+    # heuristic: short or referential
     referential = any(w in ql.split() for w in ("it","that","those","they","this","these","him","her","them")) \
                   or ql.startswith(("and ","also ","what about","how about","same","ok","hmm","continue","more","next"))
     summarize_like = any(k in ql for k in ("summarize","summary","tl;dr","abstract"))
@@ -484,6 +485,7 @@ def _to_doc(d: Dict[str,Any]) -> Optional[Doc]:
     )
 
 def _enrich_prior_docs(prior_docs: List[Doc]) -> List[Doc]:
+    # Fetch missing abstracts/types if needed (bounded)
     missing = [d.pmid for d in prior_docs if not d.abstract][:8]
     if missing:
         try:
@@ -502,6 +504,7 @@ def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedCon
     msgs = history.get("recent_messages") or []
     prior_docs_in = history.get("prior_docs") or []
 
+    # convert docs
     pd: List[Doc] = []
     for dd in prior_docs_in:
         d = _to_doc(dd)
@@ -510,6 +513,7 @@ def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedCon
 
     brief = _minify_messages(msgs)
 
+    # Try intent model (cheap), fallback to heuristic
     try:
         sys = textwrap.dedent("""
         You detect whether the latest user question is a FOLLOW-UP to the prior chat or a NEW standalone query.
@@ -602,14 +606,14 @@ def summarize(query, docs, exact_flag=False, role: Optional[str]=None):
             "citation_links": links,
             "note":"Fallback summary used."}
 
-# ---- context-aware summary ----
+# ---- context-aware summary (NEW) ----
 def summarize_with_context(query: str, docs: List[Doc], exact_flag: bool, role: Optional[str],
                            history_brief: str = "", prior_docs: Optional[List[Doc]] = None):
     prior_docs = prior_docs or []
     if not prior_docs:
         return summarize(query, docs, exact_flag=exact_flag, role=role)
 
-    # Build small prior pack (A-indexed)
+    # Build small prior pack (A-indexed for clarity)
     pcap = CFG.summary.prior_docs_for_pack
     chosen = prior_docs[:pcap]
     lines = []
@@ -666,6 +670,7 @@ If a field is missing, write 'not reported'. Ensure every claim has bracket cita
         ans = js.get("answer") or {}
         # Normalize citations: allow both numeric and 'A*'
         norm_cites: List[Any] = ans.get("evidence_citations") or []
+        # extract numeric citations for main pack only (the FE uses those to show links)
         numeric_only = []
         for x in norm_cites:
             m = re.search(r"\d+", str(x))
@@ -677,7 +682,7 @@ If a field is missing, write 'not reported'. Ensure every claim has bracket cita
         ans["key_findings"] = [str(x) for x in (ans.get("key_findings") or [])]
         ans["quality_and_limits"] = [str(x) for x in (ans.get("quality_and_limits") or [])]
         js["answer"] = ans
-        js["citation_links"] = main_links | links
+        js["citation_links"] = main_links | links  # keep both in case FE wants to render later
         return js
 
     # Fallback: regular summarize
@@ -748,7 +753,8 @@ def _fetch_docs_by_pmids(pmids: List[str]) -> List[Doc]:
     for pid in pmids:
         e = sm.get(pid, {})
         ttl = (e.get("title") or "").strip()
-        if not ttl:
+        if not ttl: 
+            # still include placeholder; efetch may still return abstract
             ttl = ""
         jr = (e.get("fulljournalname") or e.get("source") or "").strip()
         pd = e.get("pubdate", "")
@@ -771,14 +777,15 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
     t0 = time.perf_counter()
     q = norm(query); lo, hi = time_tags(q); ex = parse_not(q)
 
-    # Guardrail (kept here for completeness; in /ask we bypass for follow-ups with context)
+    # Guardrail
     guard = guardrail_domain(q)
     if not guard.get("domain_relevant", False):
         return _guardrail_payload([], lo, hi, ex, [], guard.get("reason",""))
 
+    # Check direct PMID(s) ask (exact summarize)
     direct_pmids = _extract_pmids_from_query(q)
 
-    # Resolve history intent
+    # Resolve history intent (NEW)
     ctx = resolve_context(q, history)
     q_eff = ctx.augmented_query if ctx.follow_up else q
 
@@ -795,6 +802,7 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
     variants = compose(plan, lo, hi, ex, qlen=q_tokens)
     tried_booleans, merged = [], {}
 
+    # If explicit PMID(s), short-circuit retrieval
     if direct_pmids:
         for d in _fetch_docs_by_pmids(direct_pmids):
             merged[d.pmid] = d
@@ -828,6 +836,7 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
         except Exception:
             pass
 
+    # Merge prior docs if follow-up
     if ctx.follow_up and ctx.prior_docs:
         for d in ctx.prior_docs:
             if d.pmid not in merged:
@@ -866,7 +875,7 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
         },
     }
 
-# ================= FE compatibility shim =================
+# ================= FE compatibility shim (unchanged API; internals updated) =================
 def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = False, history: Optional[Dict[str,Any]] = None) -> Tuple[str, Dict[str, Any]]:
     pipe = run_pipeline(question, role=role, history=history)
     summary = pipe.get("summary") or {}; docs = pipe.get("docs") or []

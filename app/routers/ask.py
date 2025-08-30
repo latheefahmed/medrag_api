@@ -154,44 +154,6 @@ def _collect_history_payload(sess_doc: Dict[str,Any]) -> Dict[str,Any]:
         "prior_docs": prior_docs[:8],
     }
 
-def _store_session_meta_after_answer(session_id: str, user_id: str, doc, docs_payload: List[Dict[str,Any]], intent_payload: Dict[str,Any]):
-    """
-    Keep short-term memory in session.meta without breaking schema.
-    - meta.last_docset : list of up to 5 docs (pmid,title,year,journal,abstract,url)
-    - meta.last_refs   : {"1": pmid, ...} based on current order
-    - meta.turn_ring   : capped list (<=3) of previous docsets
-    """
-    curr = doc or {}
-    meta = dict(curr.get("meta") or {})
-
-    # build last_docset (cap 5) and last_refs
-    last_docset = [{
-        "pmid": d.get("pmid"),
-        "title": d.get("title"),
-        "journal": d.get("journal"),
-        "year": d.get("year"),
-        "abstract": d.get("abstract"),
-        "url": d.get("url"),
-    } for d in docs_payload[:5]]
-    last_refs = {str(i+1): d.get("pmid") for i, d in enumerate(docs_payload[:5]) if d.get("pmid")}
-
-    # ring buffer
-    ring: List[List[Dict[str,Any]]] = list(meta.get("turn_ring") or [])
-    if last_docset:
-        ring.append(last_docset)
-    # cap at 3 turns
-    if len(ring) > 3:
-        ring = ring[-3:]
-
-    meta.update({
-        "last_docset": last_docset,
-        "last_refs": last_refs,
-        "turn_ring": ring,
-        "last_intent": intent_payload or {},
-    })
-
-    update_session(session_id, user_id, {"meta": meta})
-
 @router.post("")
 async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
     # ---------- auth ----------
@@ -222,39 +184,35 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     # Build history BEFORE appending current user message
     history_payload = _collect_history_payload(sess)
 
-    # intent resolution (move BEFORE guardrail so follow-ups can bypass)
-    q_raw = rag.norm(question)
-    ctx = rag.resolve_context(q_raw, history_payload)
-
     # append user msg immediately
     user_msg = {"id": str(uuid4()), "role": "user", "content": question, "ts": _now_ms()}
     messages: List[Dict[str, Any]] = (sess.get("messages") or []) + [user_msg]
 
     # ---------- RETRIEVAL STAGE (history-aware) ----------
     t0 = time.perf_counter()
-    q_eff = ctx.augmented_query if ctx.follow_up else q_raw
-    lo, hi = rag.time_tags(q_eff)
-    ex = rag.parse_not(q_eff)
+    q = rag.norm(question); lo, hi = rag.time_tags(q); ex = rag.parse_not(q)
 
-    # guardrail: only for new queries OR follow-ups with no usable context
-    if not (ctx.follow_up and (history_payload.get("prior_docs") or [])):
-        guard = rag.guardrail_domain(q_eff)
-        if not guard.get("domain_relevant", False):
-            right_pane = _right_pane_from_docs([], [], {"retrieve_ms": 0, "summarize_ms": 0}, overview={
-                "conclusion": "The query didn’t look biomedical. Try clinical/biomedical terms.",
-                "key_findings": [],
-                "quality_and_limits": []
-            }, intent={"follow_up": ctx.follow_up, "reason": ctx.reason, "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief})
-            assistant_msg = {
-                "id": str(uuid4()),
-                "role": "assistant",
-                "content": "We can’t search relevant biomedical terms for this question.",
-                "ts": _now_ms(),
-                "references": [],
-            }
-            messages.append(assistant_msg)
-            update_session(session_id, user_id, {"messages": messages, "rightPane": right_pane})
-            return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane}
+    guard = rag.guardrail_domain(q)
+    if not guard.get("domain_relevant", False):
+        right_pane = _right_pane_from_docs([], [], {"retrieve_ms": 0, "summarize_ms": 0}, overview={
+            "conclusion": "The query didn’t look biomedical. Try clinical/biomedical terms.",
+            "key_findings": [],
+            "quality_and_limits": []
+        })
+        assistant_msg = {
+            "id": str(uuid4()),
+            "role": "assistant",
+            "content": "We can’t search relevant biomedical terms for this question.",
+            "ts": _now_ms(),
+            "references": [],
+        }
+        messages.append(assistant_msg)
+        update_session(session_id, user_id, {"messages": messages, "rightPane": right_pane})
+        return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane}
+
+    # intent resolution (NEW)
+    ctx = rag.resolve_context(q, history_payload)
+    q_eff = ctx.augmented_query if ctx.follow_up else q
 
     # plan + compose variants
     try:
@@ -306,10 +264,9 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
             pass
 
     # add history docs if follow-up
-    if ctx.follow_up and history_payload.get("prior_docs"):
-        for dd in history_payload["prior_docs"]:
-            d = rag._to_doc(dd)
-            if d and d.pmid not in merged:
+    if ctx.follow_up and ctx.prior_docs:
+        for d in ctx.prior_docs:
+            if d.pmid not in merged:
                 merged[d.pmid] = d
 
     all_docs = list(merged.values())
@@ -345,24 +302,16 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     })
 
     # ---------- SUMMARY STAGE (background; history-aware) ----------
-    # exact single if we ended with exactly one doc AND user didn't explicitly list multiple pmids
     exact_single = len(used_docs) == 1 and not rag._extract_pmids_from_query(q_eff)
 
     def _finish_summary():
         t_sum_start = time.perf_counter()
         try:
-            if ctx.follow_up and history_payload.get("prior_docs"):
-                prior = []
-                for dd in history_payload["prior_docs"]:
-                    d = rag._to_doc(dd)
-                    if d:
-                        prior.append(d)
-                summary_obj = rag.summarize_with_context(
-                    q_raw, used_docs, exact_flag=exact_single, role=role,
-                    history_brief=ctx.brief, prior_docs=prior
-                )
+            if ctx.follow_up and ctx.prior_docs:
+                summary_obj = rag.summarize_with_context(q, used_docs, exact_flag=exact_single, role=role,
+                                                         history_brief=ctx.brief, prior_docs=ctx.prior_docs)
             else:
-                summary_obj = rag.summarize(q_raw, used_docs, exact_flag=exact_single, role=role)
+                summary_obj = rag.summarize(q, used_docs, exact_flag=exact_single, role=role)
         except Exception as e:
             summary_obj = {"answer":{"conclusion": f"(summary error) {str(e)[:200]}", "key_findings": [], "quality_and_limits": [], "evidence_citations": []}, "citation_links": {}}
         t_sum_end = time.perf_counter()
@@ -393,16 +342,8 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
             "retrieve_ms": timings_now["retrieve_ms"],
             "summarize_ms": int((t_sum_end - t_sum_start)*1000),
         }
-
-        # persist messages + right pane
+        # persist
         update_session(session_id, user_id, {"messages": new_msgs, "rightPane": rp})
-
-        # persist short-term memory in session.meta (3-turn ring)
-        try:
-            doc_after = get_session_by_id(session_id, user_id) or {}
-            _store_session_meta_after_answer(session_id, user_id, doc_after, docs_payload, intent_payload)
-        except Exception as e:
-            print(f"[META] failed to write short memory: {e!r}")
 
         try:
             create_log({
@@ -414,9 +355,6 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
                 "summarize_ms": int((t_sum_end - t_sum_start)*1000),
                 "n_results": int(len(used_docs)),
                 "ts": datetime.utcnow().isoformat(),
-                # extra observability
-                "intent_follow_up": bool(ctx.follow_up),
-                "used_context": bool(history_payload.get("prior_docs")),
             })
         except Exception as e:
             print(f"[LOGS] failed to write log: {e!r}")
