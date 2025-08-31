@@ -62,35 +62,43 @@ def _mk_references_from_rightpane(rp: Dict[str, Any] | None) -> List[Dict[str, A
     return [r for r in out if r.get("title") or r.get("pmid")]
 
 def _assistant_text_from_summary(summary: Dict[str, Any], docs: List[Dict[str, Any]]) -> str:
-    # Supports both structured JSON (default) and a plain-text answer for summarize/elaborate modes.
+    """
+    Build a chat bubble with:
+      - a short 'plain' summary (if present) WITH citations in-line,
+      - Key findings (each item can contain [n] cites),
+      - Quality & limitations,
+      - Citations block mapping [n] → paper title + link.
+    """
     if not isinstance(summary, dict) or "answer" not in summary:
         return "No summary generated."
     a = summary.get("answer") or {}
-    # If plain text is provided (summarize/elaborate), prefer it verbatim.
+
+    lines: List[str] = []
     plain = (a.get("plain") or "").strip()
     if plain:
-        return plain
+        lines.append(plain)
+        lines.append("")
 
     conclusion = (a.get("conclusion") or "").strip()
+    if conclusion and not plain:
+        lines.append(conclusion)
+        lines.append("")
+
     kf = [s for s in (a.get("key_findings") or []) if s]
     ql = [s for s in (a.get("quality_and_limits") or []) if s]
     cites = a.get("evidence_citations") or []
 
-    lines: List[str] = []
-    if conclusion:
-        lines.append(conclusion)
     if kf:
-        lines.append("")
         lines.append("Key findings:")
         for i, item in enumerate(kf, 1):
             lines.append(f"{i}. {item}")
-    if ql:
         lines.append("")
+    if ql:
         lines.append("Quality and limitations:")
         for i, item in enumerate(ql, 1):
             lines.append(f"{i}. {item}")
-    if cites:
         lines.append("")
+    if cites:
         lines.append("Citations:")
         links = {str(k): v for k, v in (summary.get("citation_links") or {}).items()}
         for n in cites:
@@ -125,14 +133,12 @@ def _right_pane_from_docs(docs: List[Dict[str, Any]], tried: List[Dict[str, str]
 def _collect_history_payload(sess_doc: Dict[str,Any]) -> Dict[str,Any]:
     """
     Build a compact history object for rag.resolve_context:
-    - last ~3 turns of messages (6 msgs), excluding guardrails
-    - prior docs from the last 1–2 assistant messages (their 'references'), excluding guardrails
+    - last ~3 turns (6 msgs), excluding prior guardrail messages
+    - references from the last 1–2 assistant messages
     """
     msgs = list(sess_doc.get("messages") or [])
-    # filter out guardrail messages
     msgs = [m for m in msgs if not (m.get("flags") or {}).get("guardrail")]
-
-    recent = msgs[-6:] if msgs else []  # ~3 turns
+    recent = msgs[-6:] if msgs else []
     prior_docs: List[Dict[str,Any]] = []
     seen_pmids = set()
     cnt = 0
@@ -198,22 +204,20 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     user_msg = {"id": str(uuid4()), "role": "user", "content": question, "ts": _now_ms()}
     messages: List[Dict[str, Any]] = (sess.get("messages") or []) + [user_msg]
 
-    # ---------- INTENT FIRST (so guardrail won't block chat-summary requests) ----------
+    # ---------- INTENT FIRST ----------
     q = rag.norm(question)
     ctx = rag.resolve_context(q, history_payload)
+    q_eff = ctx.augmented_query if ctx.follow_up else q
 
-    # ---------- guardrail (balanced) ----------
-    guard = rag.guardrail_domain(q)
-    allow_bypass = bool(
-        ctx.mode in {"summarize","elaborate","detail_paper"} or
-        (ctx.follow_up and (history_payload.get("prior_docs") or []))
-    )
-    if not guard.get("domain_relevant", False) and not allow_bypass:
+    # ---------- GUARDRAIL (balanced; let summary-style follow-ups through) ----------
+    guard = rag.guardrail_domain(q_eff)
+    bypass = ctx.follow_up or (ctx.mode in ("summarize","elaborate","detail_paper"))
+    if not guard.get("domain_relevant", False) and not bypass:
         right_pane = _right_pane_from_docs([], [], {"retrieve_ms": 0, "summarize_ms": 0}, overview={
             "conclusion": "The query didn’t look biomedical. Try clinical/biomedical terms.",
             "key_findings": [],
             "quality_and_limits": []
-        }, intent={"follow_up": False, "reason": guard.get("reason",""), "augmented_query": q, "chat_brief": ""})
+        }, intent={"follow_up": False, "reason": guard.get("reason",""), "augmented_query": q_eff, "chat_brief": ""})
         assistant_msg = {
             "id": str(uuid4()),
             "role": "assistant",
@@ -228,8 +232,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
 
     # ---------- RETRIEVAL STAGE (history-aware) ----------
     t0 = time.perf_counter()
-    lo, hi = rag.time_tags(q); ex = rag.parse_not(q)
-    q_eff = ctx.augmented_query if ctx.follow_up else q
+    lo, hi = rag.time_tags(q_eff); ex = rag.parse_not(q_eff)
 
     try:
         plan = rag.plan_tokens(q_eff)
@@ -238,9 +241,8 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
 
     variants = rag.compose(plan, lo, hi, ex, qlen=len(rag.tok(q_eff)))
     tried_booleans, merged = [], {}
-    detail_pmid: Optional[str] = None
 
-    # allow direct PMID short-circuit
+    # PMID short-circuit
     for pid in rag._extract_pmids_from_query(q_eff):
         for d in rag._fetch_docs_by_pmids([pid]):
             merged[d.pmid] = d
@@ -261,7 +263,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
         for lv in rag.widen_variants(plan, q_eff, lo, hi, ex):
             tried_booleans.append({"label": lv["label"], "query": lv["query"]})
             try:
-                if not rag.esearch(lv["query"], rag.CFG.pubmed.retmax_probe):  # cheap probe
+                if not rag.esearch(lv["query"], rag.CFG.pubmed.retmax_probe):
                     continue
                 for d in rag.retrieve(lv["query"], q_eff, lv["label"]):
                     if d.pmid not in merged:
@@ -271,39 +273,15 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
             except Exception:
                 continue
 
-    # add history docs if follow-up (re-use same evidence set when context continues)
+    # add history docs if follow-up
     if ctx.follow_up and ctx.prior_docs:
         for d in ctx.prior_docs:
             if d.pmid not in merged:
                 merged[d.pmid] = d
 
-    # If the user asked "detail the 1st/2nd paper", hoist that paper to the top and force exact mode.
-    used_docs_mode = "default"
-    if ctx.mode == "detail_paper" and (history_payload.get("prior_docs") or []):
-        idx = max(1, int(ctx.paper_index or 1))
-        try:
-            unique = []
-            seen = set()
-            for d in history_payload.get("prior_docs") or []:
-                pmid = str(d.get("pmid") or "").strip()
-                if pmid and pmid not in seen:
-                    unique.append(d); seen.add(pmid)
-            if 1 <= idx <= len(unique):
-                detail_pmid = unique[idx-1]["pmid"]
-                if detail_pmid not in merged:
-                    for d in rag._fetch_docs_by_pmids([detail_pmid]):
-                        merged[d.pmid] = d
-                used_docs_mode = "detail"
-        except Exception:
-            pass
-
     all_docs = list(merged.values())
     final_docs = rag.fuse_mmr(q_eff, all_docs) if all_docs else []
     used_docs = final_docs if final_docs else all_docs
-
-    # Reorder if detailing a specific paper
-    if used_docs_mode == "detail" and detail_pmid:
-        used_docs = sorted(used_docs, key=lambda d: 0 if d.pmid == detail_pmid else 1)
 
     t_retrieve_end = time.perf_counter()
     timings_now = {"retrieve_ms": int((t_retrieve_end - t0)*1000), "summarize_ms": 0}
@@ -316,7 +294,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
 
     intent_payload = {
         "follow_up": ctx.follow_up, "reason": ctx.reason, "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief,
-        "mode": ctx.mode, "include_citations": ctx.include_citations, "paper_index": ctx.paper_index
+        "mode": ctx.mode, "include_citations": True, "paper_index": ctx.paper_index
     }
     right_pane_initial = _right_pane_from_docs(docs_payload, tried_booleans, timings_now, overview=None, intent=intent_payload)
     references_initial = _mk_references_from_rightpane(right_pane_initial)
@@ -337,37 +315,35 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     })
 
     # ---------- SUMMARY STAGE (background; history-aware) ----------
-    exact_single = (len(used_docs) == 1 and not rag._extract_pmids_from_query(q_eff)) or (used_docs_mode == "detail")
-
     def _finish_summary():
         t_sum_start = time.perf_counter()
         try:
-            # choose path by mode
             if ctx.mode == "summarize":
                 summary_obj = rag.summarize_plain(
-                    q, used_docs, role=role, style="summary",
+                    q_eff, used_docs, role=role, style="summary",
                     history_brief=(ctx.brief if ctx.follow_up else ""),
                     prior_docs=(ctx.prior_docs if ctx.follow_up else []),
-                    include_citations=ctx.include_citations
+                    include_citations=True
                 )
             elif ctx.mode == "elaborate":
                 summary_obj = rag.summarize_plain(
-                    q, used_docs, role=role, style="elaborate",
+                    q_eff, used_docs, role=role, style="elaborate",
                     history_brief=(ctx.brief if ctx.follow_up else ""),
                     prior_docs=(ctx.prior_docs if ctx.follow_up else []),
-                    include_citations=ctx.include_citations
+                    include_citations=True
                 )
-            elif used_docs_mode == "detail":
+            elif ctx.mode == "detail_paper":
                 summary_obj = rag.summarize_detail_paper(
-                    q, used_docs, role=role, include_citations=ctx.include_citations
+                    q_eff, used_docs, role=role, include_citations=True
                 )
             else:
+                exact_single = len(used_docs) == 1 and not rag._extract_pmids_from_query(q_eff)
                 if ctx.follow_up and ctx.prior_docs:
-                    summary_obj = rag.summarize_with_context(q, used_docs, exact_flag=exact_single, role=role,
+                    summary_obj = rag.summarize_with_context(q_eff, used_docs, exact_flag=exact_single, role=role,
                                                              history_brief=ctx.brief, prior_docs=ctx.prior_docs,
                                                              include_citations=True)
                 else:
-                    summary_obj = rag.summarize(q, used_docs, exact_flag=exact_single, role=role,
+                    summary_obj = rag.summarize(q_eff, used_docs, exact_flag=exact_single, role=role,
                                                 include_citations=True)
         except Exception as e:
             summary_obj = {"answer":{"conclusion": f"(summary error) {str(e)[:200]}", "key_findings": [], "quality_and_limits": [], "evidence_citations": [], "plain": ""}, "citation_links": {}}
@@ -392,7 +368,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
         rp = doc.get("rightPane") or right_pane_initial
         ans = (summary_obj.get("answer") or {})
         rp["overview"] = {
-            "conclusion": ans.get("conclusion","") if not ans.get("plain") else ans.get("plain")[:500],
+            "conclusion": ans.get("plain")[:500] if ans.get("plain") else ans.get("conclusion",""),
             "key_findings": (ans.get("key_findings") or []),
             "quality_and_limits": (ans.get("quality_and_limits") or []),
         }
