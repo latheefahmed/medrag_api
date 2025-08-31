@@ -28,7 +28,7 @@ class PPLXCfg:
     model_plan: str = os.getenv("PPLX_MODEL_PLAN", "sonar-pro")
     model_summary: str = os.getenv("PPLX_MODEL_SUMMARY", "sonar-pro")
     model_guard: str = os.getenv("PPLX_MODEL_GUARD", "sonar-pro")
-    model_intent: str = os.getenv("PPLX_MODEL_INTENT", "sonar-mini")  # small, cheap
+    model_intent: str = os.getenv("PPLX_MODEL_INTENT", "sonar-mini")
     temperature: float = float(os.getenv("PPLX_TEMPERATURE", "0.15"))
     max_tokens: int = int(os.getenv("PPLX_MAX_TOKENS", "900"))
     search_mode_plan: Optional[str] = "academic"
@@ -37,9 +37,7 @@ class PPLXCfg:
 
 @dataclass
 class GeminiCfg:
-    # REST endpoint (no extra deps)
     url_base: str = os.getenv("GEMINI_URL_BASE", "https://generativelanguage.googleapis.com/v1beta")
-    # Use fully qualified names for REST: "models/…"
     model_plan: str = os.getenv("GEMINI_MODEL_PLAN", "models/gemini-1.5-flash")
     model_summary: str = os.getenv("GEMINI_MODEL_SUMMARY", "models/gemini-1.5-pro")
     model_guard: str = os.getenv("GEMINI_MODEL_GUARD", "models/gemini-1.5-flash")
@@ -78,7 +76,7 @@ class RetrievalCfg:
 class SummaryCfg:
     top_docs_for_pack: int = 5
     abstract_chars: int = 650
-    prior_docs_for_pack: int = 3   # carry a few prior docs
+    prior_docs_for_pack: int = 3   # small prior pack for continuity
 
 @dataclass
 class BooleanCfg:
@@ -140,10 +138,6 @@ def minmax(a: np.ndarray) -> np.ndarray:
     mn, mx = float(a.min()), float(a.max())
     return np.ones_like(a) * 0.5 if mx - mn < 1e-12 else (a - mn) / (mx - mn)
 
-def _token_set(s: str) -> set:
-    return {t.lower() for t in tok(s) if t.lower() not in STOP}
-
-# --- citation coercion helper ---
 def _coerce_citations(raw, max_idx: int) -> List[int]:
     out: List[int] = []
     for x in (raw or []):
@@ -151,8 +145,7 @@ def _coerce_citations(raw, max_idx: int) -> List[int]:
             idx = int(x)
         elif isinstance(x, str):
             m = re.search(r"\d+", x)
-            if not m:
-                continue
+            if not m: continue
             idx = int(m.group(0))
         else:
             continue
@@ -180,17 +173,10 @@ def embed(texts: List[str]) -> np.ndarray:
 
 # ================= LLMs (Perplexity primary, Gemini fallback) =================
 def _gemini_chat(messages, model, temp=None, maxtok=None) -> str:
-    """
-    Minimal REST wrapper for Gemini generateContent.
-    - messages: [{"role":"system/user/assistant","content":"..."}]
-    - returns plain text
-    """
     if not GEMINI_KEY:
         raise RuntimeError("Gemini API key missing (set GEMINI_API_KEY).")
-    # Combine/collect system text
     sys_parts = [m["content"] for m in messages if m.get("role") == "system" and (m.get("content") or "").strip()]
     sys_text = "\n".join(sys_parts).strip()
-    # Convert to Gemini 'contents'
     contents = []
     for m in messages:
         role = m.get("role", "user")
@@ -198,11 +184,8 @@ def _gemini_chat(messages, model, temp=None, maxtok=None) -> str:
             continue
         gr = "user" if role == "user" else "model"
         contents.append({"role": gr, "parts": [{"text": m.get("content","")}]})
-
-    # Ensure fully-qualified model name
     gmodel = model if str(model).startswith("models/") else f"models/{model}"
     url = f"{CFG.gemini.url_base}/{gmodel}:generateContent?key={GEMINI_KEY}"
-
     gen_cfg = {
         "temperature": CFG.gemini.temperature if temp is None else float(temp),
         "maxOutputTokens": CFG.gemini.max_tokens if maxtok is None else int(maxtok),
@@ -211,18 +194,15 @@ def _gemini_chat(messages, model, temp=None, maxtok=None) -> str:
     payload: Dict[str, Any] = {"contents": contents, "generationConfig": gen_cfg}
     if sys_text:
         payload["system_instruction"] = {"role": "system", "parts": [{"text": sys_text}]}
-
     r = S.post(url, json=payload, timeout=CFG.pubmed.timeout)
     r.raise_for_status()
     j = r.json() or {}
-    # try to extract text
     try:
         cand = (j.get("candidates") or [])[0]
         parts = ((cand.get("content") or {}).get("parts") or [])
         text = "".join(p.get("text","") for p in parts)
         return text.strip()
     except Exception:
-        # Best-effort fallback
         return json.dumps(j)[:4000]
 
 def _pplx_chat(messages, model, search_mode=None, temp=None, maxtok=None) -> str:
@@ -239,30 +219,20 @@ def _pplx_chat(messages, model, search_mode=None, temp=None, maxtok=None) -> str
     return (r.json().get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
 
 def _map_gemini_model_from_pplx(pplx_model: str) -> str:
-    if pplx_model == CFG.pplx.model_summary:
-        return CFG.gemini.model_summary
-    if pplx_model == CFG.pplx.model_plan:
-        return CFG.gemini.model_plan
-    if pplx_model == CFG.pplx.model_guard:
-        return CFG.gemini.model_guard
-    if pplx_model == CFG.pplx.model_intent:
-        return CFG.gemini.model_intent
-    # default
+    if pplx_model == CFG.pplx.model_summary:   return CFG.gemini.model_summary
+    if pplx_model == CFG.pplx.model_plan:      return CFG.gemini.model_plan
+    if pplx_model == CFG.pplx.model_guard:     return CFG.gemini.model_guard
+    if pplx_model == CFG.pplx.model_intent:    return CFG.gemini.model_intent
     return CFG.gemini.model_summary
 
 def pplx(messages, model, search_mode=None, temp=None, maxtok=None):
-    """
-    Unified LLM call:
-      1) Try Perplexity
-      2) On any error or missing key → Gemini fallback (matching purpose/model)
-    """
     try:
         return _pplx_chat(messages, model, search_mode, temp, maxtok)
     except Exception:
         g_model = _map_gemini_model_from_pplx(model)
-        # Keep temperature/max_tokens parity with the original call
-        return _gemini_chat(messages, g_model, temp=temp if temp is not None else CFG.pplx.temperature,
-                            maxtok=maxtok if maxtok is not None else CFG.pplx.max_tokens)
+        return _gemini_chat(messages, g_model,
+                            temp=CFG.pplx.temperature if temp is None else temp,
+                            maxtok=CFG.pplx.max_tokens if maxtok is None else maxtok)
 
 def json_from_text(t):
     t = re.sub(r"```(?:json)?\s*|\s*```", "", t or "").strip()
@@ -278,7 +248,7 @@ def json_from_text(t):
 
 # ================= guardrails =================
 def guardrail_domain(query: str) -> Dict[str, Any]:
-    sys = 'Output JSON: {"domain_relevant":bool,"reason":str}. Biomedical/clinical only.'
+    sys = 'Return JSON: {"domain_relevant":bool,"reason":str}. Mark true only for human biomedical/clinical topics.'
     user = json.dumps({"query": norm(query)}, ensure_ascii=False)
     try:
         content = pplx(
@@ -301,7 +271,7 @@ def plan_tokens(query):
     sys = (
         'Return JSON only: {"chunks":[],"anchors":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[],"Population":[],"Context":[]},'
         '"mesh_terms":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[]},"must_pair":{"require_intervention_vs_comparator":false},'
-        '"domain_relevant":true}. Tokens ≤3 words.'
+        '"domain_relevant":true}. Tokens ≤3 words per item.'
     )
     content = pplx(
         [{"role":"system","content":sys},
@@ -513,44 +483,24 @@ def fuse_mmr(query, docs):
         d.scores = {**(d.scores or {}), "cos": float(cos[i]), "bonus": float(bon[i]), "fused_raw": float(fused[i])}
     return [dtop[i] for i in picks]
 
-# ==================== history/context (FOLLOW-UP RESOLUTION) ====================
+# ==================== LLM INTENT CONTROLLER ====================
 @dataclass
-class ResolvedContext:
-    follow_up: bool = False
-    reason: str = ""
+class IntentDecision:
+    intent: str = "new_query"  # new_query | followup_summary | followup_detail | followup_compare | followup_refine | followup_citation_detail
+    confidence: float = 0.0
     augmented_query: str = ""
-    brief: str = ""             # compact history synopsis for the LLM
-    prior_docs: List[Doc] = field(default_factory=list)
+    referenced_indices: List[int] = field(default_factory=list)
+    reason: str = ""
+    brief: str = ""
+    prior_docs: List["Doc"] = field(default_factory=list)
 
-def _intent_fallback(query: str, recent_msgs: List[Dict[str,str]]) -> ResolvedContext:
-    ql = query.lower().strip()
-    referential = any(w in ql.split() for w in ("it","that","those","they","this","these","him","her","them")) \
-                  or ql.startswith(("and ","also ","what about","how about","same","ok","hmm","continue","more","next"))
-    summarize_like = any(k in ql for k in ("summarize","summary","tl;dr","abstract","sum up","in short","brief"))
-    follow = referential or summarize_like or len(ql.split()) <= 4
-
-    prev_user = ""
-    for m in reversed(recent_msgs):
-        if m.get("role") == "user":
-            prev_user = norm(m.get("content",""))
-            break
-
-    # ≥70% token overlap ⇒ strong follow-up signal
-    cur_set, prev_set = _token_set(query), _token_set(prev_user)
-    overlap = (len(cur_set & prev_set) / max(1, len(cur_set))) if cur_set else 0.0
-    if overlap >= 0.70:
-        follow = True
-
-    aug = (prev_user[:120] + " — " + query)[:180] if follow and prev_user else query
-    return ResolvedContext(follow_up=follow, reason="heuristic", augmented_query=aug, brief=prev_user[:160])
-
-def _minify_messages(messages: List[Dict[str,str]], max_chars: int = 320) -> str:
+def _minify_messages(messages: List[Dict[str,str]], max_chars: int = 340) -> str:
     bits = []
     for m in messages[-6:]:
-        r = m.get("role","")[:1].upper()
+        r = (m.get("role","")[:1] or "?").upper()
         c = norm(m.get("content",""))
         if not c: continue
-        bits.append(f"{r}: {c}")
+        bits.append(f"{r}:{c}")
         if sum(len(b) for b in bits) > max_chars:
             break
     return " | ".join(bits)[:max_chars]
@@ -583,37 +533,63 @@ def _enrich_prior_docs(prior_docs: List[Doc]) -> List[Doc]:
             pass
     return prior_docs
 
-def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedContext:
-    if not history:
-        return ResolvedContext(follow_up=False, reason="no-history", augmented_query=query, brief="", prior_docs=[])
-    msgs = history.get("recent_messages") or []
-    prior_docs_in = history.get("prior_docs") or []
-
+def intent_decide(query: str, history: Optional[Dict[str,Any]]) -> IntentDecision:
+    """LLM-only decision; defaults to new_query if JSON invalid."""
+    brief = _minify_messages((history or {}).get("recent_messages") or [])
+    prior_docs_in = (history or {}).get("prior_docs") or []
     pd: List[Doc] = []
     for dd in prior_docs_in:
         d = _to_doc(dd)
         if d: pd.append(d)
     pd = _enrich_prior_docs(pd)
-    brief = _minify_messages(msgs)
+
+    sys = textwrap.dedent("""
+    You are the controller for a biomedical RAG chat.
+    Classify the user's CURRENT turn relative to the prior chat (short transcript provided).
+    Only mark as a FOLLOW-UP when the wording clearly depends on the prior assistant answer
+    (e.g., "summarize the above", "elaborate", "compare those", "paper 2", "cite", "sources").
+    If it's simply on the same topic but stands alone, classify as NEW_QUERY.
+    Output STRICT JSON only with this schema:
+    {
+      "intent": "new_query" | "followup_summary" | "followup_detail" | "followup_compare" | "followup_refine" | "followup_citation_detail",
+      "confidence": 0.0-1.0,
+      "referenced_indices": [ints],   // indices like [1],[2] if user refers to specific prior citations; else []
+      "augmented_query": "resolve pronouns only when follow-up; else ''",
+      "reason": "≤12 words"
+    }
+    Be conservative: prefer "new_query" unless evidence is strong.
+    """).strip()
+
+    user = json.dumps({
+        "current_query": norm(query),
+        "chat_brief": brief
+    }, ensure_ascii=False)
 
     try:
-        sys = 'Return JSON: {"follow_up":bool,"augmented_query":str,"reason":str}.'
-        user = json.dumps({"current_query": norm(query), "chat_brief": brief}, ensure_ascii=False)
         content = pplx(
             [{"role":"system","content":sys},
              {"role":"user","content":user}],
-            CFG.pplx.model_intent, CFG.pplx.search_mode_intent, temp=0.0, maxtok=120
+            CFG.pplx.model_intent, CFG.pplx.search_mode_intent, temp=0.0, maxtok=180
         )
         js = json_from_text(content) or {}
-        follow = bool(js.get("follow_up", False))
-        aug = norm(js.get("augmented_query","")) or query
-        reason = js.get("reason","")
-        return ResolvedContext(follow_up=follow, reason=reason, augmented_query=aug, brief=brief, prior_docs=pd)
     except Exception:
-        fb = _intent_fallback(query, msgs)
-        fb.prior_docs = pd
-        fb.brief = brief or fb.brief
-        return fb
+        js = {}
+
+    intent = str(js.get("intent") or "new_query")
+    conf = float(js.get("confidence") or 0.0)
+    aug = norm(js.get("augmented_query") or "")
+    refs = [int(x) for x in (js.get("referenced_indices") or []) if isinstance(x, (int, float, str)) and str(x).isdigit()]
+    reason = str(js.get("reason") or "")
+
+    # Defensive defaults
+    if intent not in {"new_query","followup_summary","followup_detail","followup_compare","followup_refine","followup_citation_detail"}:
+        intent, conf, aug, refs, reason = "new_query", 0.0, "", [], "invalid-json"
+
+    return IntentDecision(
+        intent=intent, confidence=max(0.0, min(1.0, conf)),
+        augmented_query=aug, referenced_indices=refs, reason=reason,
+        brief=brief, prior_docs=pd
+    )
 
 # ================= evidence + summary =================
 def evidence_pack(docs, cap=5):
@@ -640,11 +616,11 @@ def summarize(query, docs, exact_flag=False, role: Optional[str]=None):
     cap = CFG.summary.top_docs_for_pack
     pack, links = evidence_pack(docs, cap=cap)
 
-    flavor = "Include [1]-style citations on each factual sentence. "
+    flavor = "Every factual sentence must include bracket citations like [1][2]. "
     if exact_flag: flavor += "Treat a single-paper focus as exact. "
     flavor += _role_flavor(role)
 
-    sys = ("Use ONLY the EVIDENCE PACK; no browsing. Respond with JSON only. " + flavor)
+    sys = ("Use ONLY the EVIDENCE PACK; do not browse. Respond with JSON only. " + flavor)
     schema = {"question":"string","answer":{"conclusion":"string","key_findings":"array","quality_and_limits":"array","evidence_citations":"array"}}
     user = f"QUESTION\n{query}\n\n{pack}\n\nTASK\nReturn MINIFIED JSON exactly matching:\n{json.dumps(schema,indent=2)}\nIf something is missing, write 'not reported'."
 
@@ -680,14 +656,12 @@ def summarize(query, docs, exact_flag=False, role: Optional[str]=None):
             "citation_links": links,
             "note":"Fallback summary used."}
 
-# ---- context-aware (combines current + prior packs) ----
 def summarize_with_context(query: str, docs: List[Doc], exact_flag: bool, role: Optional[str],
                            history_brief: str = "", prior_docs: Optional[List[Doc]] = None):
     prior_docs = prior_docs or []
     if not prior_docs:
         return summarize(query, docs, exact_flag=exact_flag, role=role)
 
-    # Prior pack
     pcap = CFG.summary.prior_docs_for_pack
     chosen = prior_docs[:pcap]
     lines = []
@@ -700,11 +674,9 @@ def summarize_with_context(query: str, docs: List[Doc], exact_flag: bool, role: 
         lines.append(f"{head}\n{body}")
     prior_pack = ("PRIOR CONTEXT PACK\n" + "\n\n".join(lines)) if lines else ""
 
-    # Main pack
     cap = CFG.summary.top_docs_for_pack
     main_pack, main_links = evidence_pack(docs, cap=cap)
 
-    # Compose
     flavor = _role_flavor(role)
     sys = ("Ground your answer to the packs only. Prefer current EVIDENCE PACK; use PRIOR CONTEXT solely for continuity. "
            "Return JSON only; include [1]-style cites for current pack and [A1]-style when needed for prior. " + flavor)
@@ -754,7 +726,6 @@ Cite from [1..{min(cap,len(docs))}] for current evidence; if referring to prior 
         js["citation_links"] = main_links | links
         return js
 
-    # Fallback: regular summarize
     return summarize(query, docs, exact_flag=exact_flag, role=role)
 
 # ======== plain-summary mode (no citations, no bullets) =========
@@ -792,7 +763,7 @@ Return plain text summary. No lists, no headings, no brackets."""
 
     return {"plain": text}
 
-# ================= helpers =================
+# ======== small helpers kept for router/back-compat ========
 def time_tags(q):
     ql = q.lower()
     m_b = re.search(r"\bbetween\s+((?:19|20)\d{2})\s+(?:and|-|to)\s+((?:19|20)\d{2})\b", ql)
@@ -827,7 +798,6 @@ def widen_variants(plan, q, lo, hi, ex):
     chans.append({"label":"ultra_relaxed","query": ultra_relaxed(q, lo, hi, [])})
     return chans
 
-# ================= pipeline (compat shim; ask.py uses its own routing) =================
 def _extract_pmids_from_query(q: str) -> List[str]:
     pmids = set()
     for m in re.finditer(r"\bPMID[:\s]*([0-9]{5,8})\b", q, flags=re.I):
@@ -860,153 +830,13 @@ def _fetch_docs_by_pmids(pmids: List[str]) -> List[Doc]:
         ))
     return out
 
-def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,Any]] = None):
-    # Provided for compatibility; ask.py now orchestrates the smarter flows.
-    t0 = time.perf_counter()
-    q = norm(query); lo, hi = time_tags(q); ex = parse_not(q)
-
-    guard = guardrail_domain(q)
-    if not guard.get("domain_relevant", False):
-        return {
-            "docs": [],
-            "summary": {"answer":{"conclusion":"We can’t search relevant keywords from our PubMed-backed database. Please try another query using healthcare or biomedical terminology.","key_findings":[],"quality_and_limits":[],"evidence_citations":[]}},
-            "plan": {"chunks": []}, "time_tags": [lo, hi], "exclusions": ex, "booleans": [],
-            "timings": {"retrieve_ms": 0, "summarize_ms": 0}
-        }
-
-    ctx = resolve_context(q, history)
-    q_eff = ctx.augmented_query if ctx.follow_up else q
-
-    try:
-        plan = plan_tokens(q_eff)
-    except Exception:
-        plan = {"chunks":[t for t in tok(q_eff) if t.lower() not in STOP][:4],"anchors":{},"domain_relevant":True}
-
-    if not plan.get("domain_relevant", True):
-        return {
-            "docs": [], "summary": {"answer":{"conclusion":"The query did not appear biomedical.","key_findings":[],"quality_and_limits":[],"evidence_citations":[]}},
-            "plan":{"chunks": plan.get("chunks", [])}, "time_tags":[lo,hi], "exclusions":ex, "booleans":[], "timings":{"retrieve_ms":0,"summarize_ms":0}
-        }
-
-    q_tokens = len(tok(q_eff))
-    variants = compose(plan, lo, hi, ex, qlen=q_tokens)
-    tried_booleans, merged = [], {}
-    direct_pmids = _extract_pmids_from_query(q)
-
-    if direct_pmids:
-        for d in _fetch_docs_by_pmids(direct_pmids):
-            merged[d.pmid] = d
-
-    for v in variants:
-        if len(merged) >= CFG.retrieval.topk_titles:
-            break
-        tried_booleans.append({"label": v["label"], "query": v["query"]})
-        try:
-            if not esearch(v["query"], CFG.pubmed.retmax_probe): continue
-            for d in retrieve(v["query"], q_eff, v["label"]): merged[d.pmid] = d
-        except Exception:
-            continue
-
-    if len(merged) < CFG.retrieval.min_final:
-        for lv in widen_variants(plan, q_eff, lo, hi, ex):
-            if len(merged) >= CFG.retrieval.min_final: break
-            tried_booleans.append({"label": lv["label"], "query": lv["query"]})
-            try:
-                if not esearch(lv["query"], CFG.pubmed.retmax_probe): continue
-                for d in retrieve(lv["query"], q_eff, lv["label"]):
-                    if d.pmid not in merged: merged[d.pmid] = d
-            except Exception:
-                continue
-
-    if ctx.follow_up and ctx.prior_docs:
-        for d in ctx.prior_docs:
-            if d.pmid not in merged:
-                merged[d.pmid] = d
-
-    all_docs = list(merged.values())
-    final_docs = fuse_mmr(q_eff, all_docs) if all_docs else []
-    used_docs = final_docs if final_docs else all_docs
-
-    t_retrieve_end = time.perf_counter()
-
-    if not used_docs:
-        return {
-            "docs": [], "summary": {"answer":{"conclusion":"No PubMed items were found.","key_findings":[],"quality_and_limits":[],"evidence_citations":[]}},
-            "plan":{"chunks": plan.get("chunks", [])}, "time_tags":[lo,hi], "exclusions":ex, "booleans": tried_booleans,
-            "timings":{"retrieve_ms": int((t_retrieve_end - t0)*1000), "summarize_ms": 0}
-        }
-
-    t_sum_start = time.perf_counter()
-    if ctx.follow_up and ctx.prior_docs:
-        summary_obj = summarize_with_context(q, used_docs, exact_flag=(len(used_docs)==1 and not direct_pmids), role=role,
-                                             history_brief=ctx.brief, prior_docs=ctx.prior_docs)
-    else:
-        summary_obj = summarize(q, used_docs, exact_flag=(len(used_docs)==1 and not direct_pmids), role=role)
-    t_sum_end = time.perf_counter()
-
-    return {
-        "docs": [{**asdict(d), "url": pmid_url(d.pmid)} for d in used_docs],
-        "summary": summary_obj,
-        "plan": {"chunks": plan.get("chunks", [])},
-        "time_tags": [lo, hi],
-        "exclusions": ex,
-        "booleans": tried_booleans,
-        "intent": {"follow_up": ctx.follow_up, "reason": ctx.reason, "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief},
-        "timings": {
-            "retrieve_ms": int((t_retrieve_end - t0)*1000),
-            "summarize_ms": int((t_sum_end - t_sum_start)*1000),
-        },
-    }
+# Compatibility shims (not used by new router flow)
+def run_pipeline(*args, **kwargs):
+    return {"docs": [], "summary": {"answer":{"conclusion":"Use /ask endpoint."}}}
 
 def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = False, history: Optional[Dict[str,Any]] = None) -> Tuple[str, Dict[str, Any]]:
-    pipe = run_pipeline(question, role=role, history=history)
+    pipe = {"summary":{"answer":{"conclusion":"Use /ask endpoint."}}, "docs":[]}
     summary = pipe.get("summary") or {}; docs = pipe.get("docs") or []
-
-    def _list_lines(items: List[str]) -> List[str]:
-        out = []
-        for i, x in enumerate(items or [], start=1):
-            if x: out.append(f"{i}. {x.strip()}")
-        return out
-
-    if isinstance(summary, dict) and "answer" in summary:
-        a = summary["answer"] or {}
-        conclusion = (a.get("conclusion") or "").strip()
-        kf = _list_lines(a.get("key_findings") or [])
-        ql = _list_lines(a.get("quality_and_limits") or [])
-        cites = a.get("evidence_citations") or []
-        links = {str(k): v for k, v in (summary.get("citation_links") or {}).items()}
-
-        lines = []
-        if conclusion: lines += [conclusion, ""]
-        if kf: lines += ["Key findings:", *kf, ""]
-        if ql: lines += ["Quality and limitations:", *ql, ""]
-        if cites:
-            lines.append("Citations:")
-            for n in cites:
-                try:
-                    idx = int(n)
-                except Exception:
-                    continue
-                title = docs[idx-1]["title"] if 1 <= idx <= len(docs) else f"Reference {idx}"
-                url = links.get(str(idx)) or (docs[idx-1].get("url") if 1 <= idx <= len(docs) else "")
-                lines.append(f"{idx}. {title} {('- ' + url) if url else ''}")
-        assistant_text = "\n".join([s for s in lines if s is not None])
-    else:
-        assistant_text = "No summary generated."
-
-    results = [{"pmid": d.get("pmid"), "title": d.get("title"), "journal": d.get("journal"),
-                "year": d.get("year"), "url": d.get("url"),
-                "score": (d.get("scores") or {}).get("fused_raw") if d.get("scores") else None,
-                "abstract": d.get("abstract")} for d in docs]
-
-    right_pane = {
-        "results": results,
-        "booleans": [{"group": b.get("label",""), "query": b.get("query",""), "note": ""} for b in (pipe.get("booleans") or [])],
-        "plan": {"chunks": (pipe.get("plan") or {}).get("chunks", []),
-                 "time_tags": pipe.get("time_tags", []),
-                 "exclusions": pipe.get("exclusions", [])},
-        "overview": None,
-        "timings": pipe.get("timings") or {"retrieve_ms": 0, "summarize_ms": 0},
-        "intent": pipe.get("intent") or {},
-    }
+    assistant_text = (summary.get("answer") or {}).get("conclusion","")
+    right_pane = {"results": [], "booleans": [], "plan": {"chunks": [],"time_tags":[],"exclusions":[]}, "overview": None, "timings": {"retrieve_ms":0,"summarize_ms":0}, "intent": {}}
     return assistant_text, right_pane
