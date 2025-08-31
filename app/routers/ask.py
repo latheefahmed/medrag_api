@@ -7,6 +7,7 @@ from typing import Optional, Dict, Any, List
 from uuid import uuid4
 import time
 from datetime import datetime
+import re
 
 from app.security import get_current_user
 from app.db import (
@@ -118,41 +119,85 @@ def _right_pane_from_docs(docs: List[Dict[str, Any]], tried: List[Dict[str, str]
 
 def _collect_history_payload(sess_doc: Dict[str,Any]) -> Dict[str,Any]:
     """
-    Build a compact history object for rag.resolve_context:
+    Build compact history for rag.resolve_context:
     - last ~3 turns of messages
     - prior docs from the last 1–2 assistant messages (their 'references')
+    - the ordered references list from the latest assistant message (for [#] resolution)
     """
     msgs = list(sess_doc.get("messages") or [])
-    recent = msgs[-6:] if msgs else []  # ~3 turns
+    recent = msgs[-6:] if msgs else []
     prior_docs: List[Dict[str,Any]] = []
-    # walk backward, collect references from the last two assistant messages
     seen_pmids = set()
     cnt = 0
+    last_refs_ordered = []
     for m in reversed(recent):
-        if m.get("role") != "assistant":
-            continue
-        refs = m.get("references") or []
-        for r in refs:
-            pmid = str(r.get("pmid") or "").strip()
-            if pmid and pmid not in seen_pmids:
-                seen_pmids.add(pmid)
-                prior_docs.append({
-                    "pmid": pmid,
-                    "title": r.get("title"),
-                    "journal": r.get("journal"),
-                    "year": r.get("year"),
-                    "abstract": r.get("abstract"),
-                    "score": r.get("score"),
-                    "url": r.get("url"),
-                    "from_label": "history"
-                })
-        cnt += 1
-        if cnt >= 2:
-            break
+        if m.get("role") == "assistant":
+            if not last_refs_ordered and (m.get("references") or []):
+                last_refs_ordered = m["references"]
+            refs = m.get("references") or []
+            for r in refs:
+                pmid = str(r.get("pmid") or "").strip()
+                if pmid and pmid not in seen_pmids:
+                    seen_pmids.add(pmid)
+                    prior_docs.append({
+                        "pmid": pmid,
+                        "title": r.get("title"),
+                        "journal": r.get("journal"),
+                        "year": r.get("year"),
+                        "abstract": r.get("abstract"),
+                        "score": r.get("score"),
+                        "url": r.get("url"),
+                        "from_label": "history"
+                    })
+            cnt += 1
+            if cnt >= 2:
+                break
     return {
         "recent_messages": recent,
         "prior_docs": prior_docs[:8],
+        "last_refs_ordered": last_refs_ordered[:20],
     }
+
+# ======= intent helpers =======
+_SUMMARY_REGEX = re.compile(r"\b(summarise|summarize|summary|tl;dr|sum up|in short|brief|short version|simplify|explain simply)\b", re.I)
+_DETAIL_REGEX  = re.compile(r"\b(detail|deep dive|explain|methods|limitations|strengths|weaknesses|discuss|analy[sz]e|show sources|show citations)\b", re.I)
+
+_REF_NUM   = re.compile(r"(?:\[(\d+)\])|(?:\b(?:paper|study|trial|citation)\s*(\d+)\b)", re.I)
+_ORDINALS  = {"first":1,"second":2,"third":3,"fourth":4,"fifth":5,"sixth":6,"seventh":7,"eighth":8,"ninth":9,"tenth":10}
+
+def _wants_plain_summary(q: str) -> bool:
+    return bool(_SUMMARY_REGEX.search(q or ""))
+
+def _wants_detail(q: str) -> bool:
+    return bool(_DETAIL_REGEX.search(q or ""))
+
+def _extract_ref_indices(q: str) -> list[int]:
+    out = []
+    for m in _REF_NUM.finditer(q or ""):
+        for g in m.groups():
+            if g:
+                try: out.append(int(g))
+                except: pass
+    for word, n in _ORDINALS.items():
+        if re.search(rf"\b{word}\b", q or "", re.I):
+            out.append(n)
+    ret, seen = [], set()
+    for i in out:
+        if 1 <= i <= 20 and i not in seen:
+            seen.add(i); ret.append(i)
+    return ret
+
+def _as_doc(ref: dict) -> "rag.Doc":
+    return rag.Doc(
+        pmid=str(ref.get("pmid") or ""),
+        title=ref.get("title") or "",
+        journal=ref.get("journal") or "",
+        year=int(ref.get("year") or 0),
+        abstract=ref.get("abstract") or "",
+        pubtypes=[],
+        scores={"bm25_group": float(ref.get("score") or 0.0)},
+        from_label="history",
+    )
 
 @router.post("")
 async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
@@ -188,12 +233,13 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     user_msg = {"id": str(uuid4()), "role": "user", "content": question, "ts": _now_ms()}
     messages: List[Dict[str, Any]] = (sess.get("messages") or []) + [user_msg]
 
-    # ---------- RETRIEVAL STAGE (history-aware) ----------
-    t0 = time.perf_counter()
-    q = rag.norm(question); lo, hi = rag.time_tags(q); ex = rag.parse_not(q)
+    # ---------- INTENT + (conditional) GUARD ----------
+    q_norm = rag.norm(question)
+    ctx = rag.resolve_context(q_norm, history_payload)
 
-    guard = rag.guardrail_domain(q)
-    if not guard.get("domain_relevant", False):
+    # Skip guardrail if it's a follow-up AND we already have vetted prior docs
+    guard_ok = True if (ctx.follow_up and history_payload.get("prior_docs")) else rag.guardrail_domain(q_norm).get("domain_relevant", False)
+    if not guard_ok:
         right_pane = _right_pane_from_docs([], [], {"retrieve_ms": 0, "summarize_ms": 0}, overview={
             "conclusion": "The query didn’t look biomedical. Try clinical/biomedical terms.",
             "key_findings": [],
@@ -210,11 +256,152 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
         update_session(session_id, user_id, {"messages": messages, "rightPane": right_pane})
         return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane}
 
-    # intent resolution (NEW)
-    ctx = rag.resolve_context(q, history_payload)
-    q_eff = ctx.augmented_query if ctx.follow_up else q
+    # ---------- FOLLOW-UP: user points to specific citation indices or asks to detail (WITH citations) ----------
+    ref_idxs = _extract_ref_indices(question)
+    if ctx.follow_up and (ref_idxs or _wants_detail(question)) and history_payload.get("last_refs_ordered"):
+        ordered_refs = history_payload["last_refs_ordered"]
+        focus_docs = []
+        if ref_idxs:
+            for i in ref_idxs:
+                if 1 <= i <= len(ordered_refs):
+                    focus_docs.append(_as_doc(ordered_refs[i-1]))
+        if not focus_docs:
+            # if no valid numeric match but they asked to "detail", fall back to all prior docs
+            focus_docs = [ _as_doc(r) for r in ordered_refs ] or [rag._to_doc(d) for d in history_payload.get("prior_docs") or []]  # type: ignore
+            focus_docs = [d for d in focus_docs if d]
 
-    # plan + compose variants
+        docs_payload = [{
+            "pmid": d.pmid, "title": d.title, "journal": d.journal, "year": d.year,
+            "url": rag.pmid_url(d.pmid), "scores": d.scores, "abstract": d.abstract
+        } for d in focus_docs]
+
+        intent_payload = {"follow_up": True, "reason": ctx.reason or "detail-citation", "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief}
+        right_pane_initial = _right_pane_from_docs(docs_payload, tried=[], timings={"retrieve_ms": 0, "summarize_ms": 0}, overview=None, intent=intent_payload)
+        references_initial = _mk_references_from_rightpane(right_pane_initial)
+
+        assistant_msg = {
+            "id": str(uuid4()),
+            "role": "assistant",
+            "content": "",  # will be filled by background detail summary (WITH citations)
+            "ts": _now_ms(),
+            "references": references_initial,
+        }
+        messages.append(assistant_msg)
+        update_session(session_id, user_id, {"messages": messages, "rightPane": right_pane_initial})
+
+        def _finish_detail():
+            t_sum_start = time.perf_counter()
+            try:
+                exact_single = len(focus_docs) == 1
+                summary_obj = rag.summarize(question, focus_docs, exact_flag=exact_single, role=role)
+                text = _assistant_text_from_summary(summary_obj, docs_payload)
+            except Exception as e:
+                text = f"(summary error) {str(e)[:200]}"
+            t_sum_end = time.perf_counter()
+
+            doc = get_session_by_id(session_id, user_id) or {}
+            msgs = doc.get("messages") or []
+            new_msgs = []
+            for m in msgs:
+                if m.get("id") == assistant_msg["id"]:
+                    nm = dict(m); nm["content"] = text; new_msgs.append(nm)
+                else:
+                    new_msgs.append(m)
+
+            rp = doc.get("rightPane") or right_pane_initial
+            rp["overview"] = {"conclusion": (summary_obj.get("answer") or {}).get("conclusion",""),
+                              "key_findings": (summary_obj.get("answer") or {}).get("key_findings", []),
+                              "quality_and_limits": (summary_obj.get("answer") or {}).get("quality_and_limits", [])}
+            rp["timings"] = {"retrieve_ms": 0, "summarize_ms": int((t_sum_end - t_sum_start)*1000)}
+            update_session(session_id, user_id, {"messages": new_msgs, "rightPane": rp})
+
+            try:
+                create_log({
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "query": question,
+                    "response": text[:8000],
+                    "fetch_ms": 0,
+                    "summarize_ms": int((t_sum_end - t_sum_start)*1000),
+                    "n_results": int(len(focus_docs)),
+                    "ts": datetime.utcnow().isoformat(),
+                })
+            except Exception as e:
+                print(f"[LOGS] failed to write log: {e!r}")
+
+        background_tasks.add_task(_finish_detail)
+        return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane_initial}
+
+    # ---------- FOLLOW-UP: explicit summarize/tl;dr (NO citations) ----------
+    if ctx.follow_up and history_payload.get("prior_docs") and _wants_plain_summary(question):
+        prior_docs = [rag._to_doc(d) for d in history_payload["prior_docs"]]  # type: ignore
+        prior_docs = [d for d in prior_docs if d]
+
+        docs_payload = [{
+            "pmid": d.pmid, "title": d.title, "journal": d.journal, "year": d.year,
+            "url": rag.pmid_url(d.pmid), "scores": d.scores, "abstract": d.abstract
+        } for d in prior_docs]
+
+        intent_payload = {"follow_up": True, "reason": ctx.reason or "plain-summary", "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief}
+        right_pane_initial = _right_pane_from_docs(docs_payload, tried=[], timings={"retrieve_ms": 0, "summarize_ms": 0}, overview=None, intent=intent_payload)
+        references_initial = _mk_references_from_rightpane(right_pane_initial)
+
+        assistant_msg = {
+            "id": str(uuid4()),
+            "role": "assistant",
+            "content": "",  # will be filled by background plain summary
+            "ts": _now_ms(),
+            "references": references_initial,
+        }
+        messages.append(assistant_msg)
+        update_session(session_id, user_id, {"messages": messages, "rightPane": right_pane_initial})
+
+        def _finish_plain():
+            t_sum_start = time.perf_counter()
+            try:
+                # Token-conserving: pass only main pack docs; no duplicate "prior pack"
+                plain = rag.summarize_plain(question, prior_docs, role=role, history_brief=ctx.brief, prior_docs=None)
+                text = plain.get("plain","").strip() or "No summary generated."
+            except Exception as e:
+                text = f"(summary error) {str(e)[:200]}"
+            t_sum_end = time.perf_counter()
+
+            doc = get_session_by_id(session_id, user_id) or {}
+            msgs = doc.get("messages") or []
+            new_msgs = []
+            for m in msgs:
+                if m.get("id") == assistant_msg["id"]:
+                    nm = dict(m); nm["content"] = text; new_msgs.append(nm)
+                else:
+                    new_msgs.append(m)
+
+            rp = doc.get("rightPane") or right_pane_initial
+            rp["overview"] = {"conclusion": text, "key_findings": [], "quality_and_limits": []}
+            rp["timings"] = {"retrieve_ms": 0, "summarize_ms": int((t_sum_end - t_sum_start)*1000)}
+            update_session(session_id, user_id, {"messages": new_msgs, "rightPane": rp})
+
+            try:
+                create_log({
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "query": question,
+                    "response": text[:8000],
+                    "fetch_ms": 0,
+                    "summarize_ms": int((t_sum_end - t_sum_start)*1000),
+                    "n_results": int(len(docs_payload)),
+                    "ts": datetime.utcnow().isoformat(),
+                })
+            except Exception as e:
+                print(f"[LOGS] failed to write log: {e!r}")
+
+        background_tasks.add_task(_finish_plain)
+        return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane_initial}
+
+    # ---------- Retrieval path (NEW or refine/compare follow-up) ----------
+    t0 = time.perf_counter()
+    lo, hi = rag.time_tags(q_norm); ex = rag.parse_not(q_norm)
+    q_eff = ctx.augmented_query if ctx.follow_up else q_norm
+
     try:
         plan = rag.plan_tokens(q_eff)
     except Exception:
@@ -231,7 +418,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     for v in variants:
         tried_booleans.append({"label": v["label"], "query": v["query"]})
         try:
-            if not rag.esearch(v["query"], rag.CFG.pubmed.retmax_probe):  # cheap probe
+            if not rag.esearch(v["query"], rag.CFG.pubmed.retmax_probe):
                 continue
             for d in rag.retrieve(v["query"], q_eff, v["label"]):
                 merged[d.pmid] = d
@@ -244,7 +431,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
         for lv in rag.widen_variants(plan, q_eff, lo, hi, ex):
             tried_booleans.append({"label": lv["label"], "query": lv["query"]})
             try:
-                if not rag.esearch(lv["query"], rag.CFG.pubmed.retmax_probe):  # cheap probe
+                if not rag.esearch(lv["query"], rag.CFG.pubmed.retmax_probe):
                     continue
                 for d in rag.retrieve(lv["query"], q_eff, lv["label"]):
                     if d.pmid not in merged:
@@ -254,19 +441,10 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
             except Exception:
                 continue
 
-    if not merged:
-        try:
-            fb = rag.ultra_relaxed(q_eff, lo, hi, ex)
-            tried_booleans.append({"label":"fallback_compact","query":fb})
-            for d in rag.retrieve(fb, q_eff, "fallback_compact"):
-                merged[d.pmid] = d
-        except Exception:
-            pass
-
-    # add history docs if follow-up
-    if ctx.follow_up and ctx.prior_docs:
-        for d in ctx.prior_docs:
-            if d.pmid not in merged:
+    # add history docs if follow-up (refine/compare)
+    if ctx.follow_up and history_payload.get("prior_docs"):
+        for d in [rag._to_doc(x) for x in history_payload["prior_docs"]]:
+            if d and d.pmid not in merged:
                 merged[d.pmid] = d
 
     all_docs = list(merged.values())
@@ -276,7 +454,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     t_retrieve_end = time.perf_counter()
     timings_now = {"retrieve_ms": int((t_retrieve_end - t0)*1000), "summarize_ms": 0}
 
-    # prepare right pane (results only) + placeholder assistant message
+    # prepare right pane (results) + placeholder assistant message
     docs_payload = [{
         "pmid": d.pmid, "title": d.title, "journal": d.journal, "year": d.year,
         "url": rag.pmid_url(d.pmid), "scores": d.scores, "abstract": d.abstract
@@ -294,32 +472,34 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
         "references": references_initial,
     }
     messages.append(assistant_msg)
-
     update_session(session_id, user_id, {
         "messages": messages,
         "meta": sess.get("meta") or {},
         "rightPane": right_pane_initial
     })
 
-    # ---------- SUMMARY STAGE (background; history-aware) ----------
+    # ---------- SUMMARY (background; context-aware if follow-up) ----------
     exact_single = len(used_docs) == 1 and not rag._extract_pmids_from_query(q_eff)
 
     def _finish_summary():
         t_sum_start = time.perf_counter()
         try:
-            if ctx.follow_up and ctx.prior_docs:
-                summary_obj = rag.summarize_with_context(q, used_docs, exact_flag=exact_single, role=role,
-                                                         history_brief=ctx.brief, prior_docs=ctx.prior_docs)
+            if ctx.follow_up and history_payload.get("prior_docs"):
+                prior_docs = [rag._to_doc(d) for d in history_payload["prior_docs"]]  # type: ignore
+                prior_docs = [d for d in prior_docs if d]
+                summary_obj = rag.summarize_with_context(question, used_docs, exact_flag=exact_single, role=role,
+                                                         history_brief=ctx.brief, prior_docs=prior_docs)
             else:
-                summary_obj = rag.summarize(q, used_docs, exact_flag=exact_single, role=role)
+                summary_obj = rag.summarize(question, used_docs, exact_flag=exact_single, role=role)
         except Exception as e:
-            summary_obj = {"answer":{"conclusion": f"(summary error) {str(e)[:200]}", "key_findings": [], "quality_and_limits": [], "evidence_citations": []}, "citation_links": {}}
+            summary_obj = {"answer":{"conclusion": f"(summary error) {str(e)[:200]}",
+                                     "key_findings": [], "quality_and_limits": [], "evidence_citations": []},
+                           "citation_links": {}}
         t_sum_end = time.perf_counter()
 
         assistant_text = _assistant_text_from_summary(summary_obj, docs_payload)
         refs = _mk_references_from_rightpane(right_pane_initial)
 
-        # update session: replace placeholder message content; enrich rightPane with overview + timings
         doc = get_session_by_id(session_id, user_id) or {}
         msgs = doc.get("messages") or []
         new_msgs = []
@@ -342,7 +522,6 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
             "retrieve_ms": timings_now["retrieve_ms"],
             "summarize_ms": int((t_sum_end - t_sum_start)*1000),
         }
-        # persist
         update_session(session_id, user_id, {"messages": new_msgs, "rightPane": rp})
 
         try:
@@ -360,6 +539,4 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
             print(f"[LOGS] failed to write log: {e!r}")
 
     background_tasks.add_task(_finish_summary)
-
-    # return immediately with references
     return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane_initial}
