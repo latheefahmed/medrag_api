@@ -9,7 +9,7 @@ from urllib3.util import Retry
 from rank_bm25 import BM25Okapi
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-# ---- optional embedding cache (in-memory or Qdrant via app.services.embed_cache) ----
+# optional embed cache
 try:
     from app.services.embed_cache import (
         cache_query_vec, cache_doc_vec,
@@ -28,7 +28,7 @@ class PPLXCfg:
     model_plan: str = os.getenv("PPLX_MODEL_PLAN", "sonar-pro")
     model_summary: str = os.getenv("PPLX_MODEL_SUMMARY", "sonar-pro")
     model_guard: str = os.getenv("PPLX_MODEL_GUARD", "sonar-pro")
-    model_intent: str = os.getenv("PPLX_MODEL_INTENT", "sonar-mini")  # small, cheap
+    model_intent: str = os.getenv("PPLX_MODEL_INTENT", "sonar-mini")
     temperature: float = float(os.getenv("PPLX_TEMPERATURE", "0.15"))
     max_tokens: int = int(os.getenv("PPLX_MAX_TOKENS", "900"))
     search_mode_plan: Optional[str] = "academic"
@@ -66,7 +66,7 @@ class RetrievalCfg:
 class SummaryCfg:
     top_docs_for_pack: int = 5
     abstract_chars: int = 650
-    prior_docs_for_pack: int = 3   # carry a few prior docs
+    prior_docs_for_pack: int = 3
 
 @dataclass
 class BooleanCfg:
@@ -86,7 +86,6 @@ class Cfg:
 
 CFG = Cfg()
 
-# env keys
 PPLX_KEY = os.getenv("PERPLEXITY_API_KEY", "").strip()
 PUBMED_KEY = os.getenv("PUBMED_API_KEY", "").strip()
 
@@ -159,7 +158,7 @@ def embed(texts: List[str]) -> np.ndarray:
     if not texts: return np.zeros((0, 768), dtype=np.float32)
     return _EMB.encode(texts, CFG.rank.embed_batch)
 
-# ================= Perplexity (LLM) =================
+# ================= LLM helpers =================
 def _need_pplx():
     if not PPLX_KEY:
         raise RuntimeError("Perplexity API key missing or invalid (set PERPLEXITY_API_KEY).")
@@ -190,10 +189,6 @@ def json_from_text(t):
 
 # ================= guardrails =================
 def guardrail_domain(query: str) -> Dict[str, Any]:
-    """
-    Returns {"domain_relevant": bool, "reason": str}
-    True only for human biomedical/clinical scope. Token-light and robust.
-    """
     sys = textwrap.dedent("""
     You are a strict gatekeeper for a PubMed-backed biomedical QA system.
     Output STRICT JSON only.
@@ -214,7 +209,6 @@ def guardrail_domain(query: str) -> Dict[str, Any]:
     except Exception:
         js = None
     if not js:
-        # very light fallback; better to pass than block legitimate medical asks
         words = [t for t in tok(query) if t.lower() not in STOP]
         return {"domain_relevant": len(words) >= 2, "reason": "Heuristic fallback"}
     return {"domain_relevant": bool(js.get("domain_relevant", False)), "reason": str(js.get("reason",""))}
@@ -223,14 +217,9 @@ def guardrail_domain(query: str) -> Dict[str, Any]:
 def plan_tokens(query):
     sys = textwrap.dedent("""
     You are a biomedical retrieval planner. Output STRICT JSON only.
-    Goal: craft minimal PubMed tokens (≤3 words each). Group by
-    Disease, Intervention, Comparator, Outcome, Population, Context.
-    If Intervention & Comparator exist → must_pair=true. Include boolean "domain_relevant".
-    JSON:
-    {"chunks":[],"anchors":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[],"Population":[],"Context":[]},
-     "mesh_terms":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[]},
-     "must_pair":{"require_intervention_vs_comparator":false},
-     "domain_relevant":true}
+    Goal: minimal PubMed tokens (≤3 words). Group by Disease, Intervention, Comparator, Outcome, Population, Context.
+    If Intervention & Comparator exist → must_pair=true. Include "domain_relevant".
+    JSON: {"chunks":[],"anchors":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[],"Population":[],"Context":[]},"mesh_terms":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[]},"must_pair":{"require_intervention_vs_comparator":false},"domain_relevant":true}
     """).strip()
     content = pplx(
         [{"role":"system","content":sys},
@@ -449,7 +438,9 @@ class ResolvedContext:
     reason: str = ""
     augmented_query: str = ""
     score: float = 0.0
-    brief: str = ""             # compact history synopsis
+    action: str = "normal"         # normal | summarize_prior | paper_detail
+    paper_index: int = 0           # 1-based if requested
+    brief: str = ""
     prior_docs: List[Doc] = field(default_factory=list)
 
 def _minify_messages(messages: List[Dict[str,str]], max_chars: int = 320) -> str:
@@ -503,7 +494,6 @@ def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedCon
         if d: pd.append(d)
     pd = _enrich_prior_docs(pd)
 
-    # If there are no prior docs, we won't consider follow-up even if the classifier says yes.
     has_prior = len(pd) > 0
 
     brief = _minify_messages(msgs)
@@ -512,9 +502,10 @@ def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedCon
     try:
         sys = textwrap.dedent("""
         Decide if CURRENT_QUERY is a FOLLOW-UP to the recent chat or a NEW question.
-        Return STRICT JSON: {"follow_up": bool, "score": 0..1, "augmented_query": "≤15 words", "reason": "≤12 words"}.
-        FOLLOW-UP only if it logically depends on prior turns (pronouns, "summarize that", "compare with #2", etc.).
-        If NEW, set augmented_query="".
+        Return STRICT JSON: {"follow_up": bool, "score": 0..1, "action": "normal|summarize_prior|paper_detail", "paper_index": 0, "augmented_query": "≤15 words", "reason": "≤12 words"}.
+        - summarize_prior: user asks to "summarize the above/that".
+        - paper_detail: user refers to a specific paper, e.g., "explain the 1st paper", "paper 2", "first study".
+        - If NEW, set augmented_query="" and action="normal".
         """).strip()
         user = json.dumps({
             "CURRENT_QUERY": norm(query),
@@ -524,17 +515,32 @@ def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedCon
         content = pplx(
             [{"role":"system","content":sys},
              {"role":"user","content":user}],
-            CFG.pplx.model_intent, CFG.pplx.search_mode_intent, temp=0.0, maxtok=140
+            CFG.pplx.model_intent, CFG.pplx.search_mode_intent, temp=0.0, maxtok=160
         )
         js = json_from_text(content) or {}
         score = float(js.get("score", 0.0))
+        action = (js.get("action") or "normal").strip()
+        paper_index = int(js.get("paper_index") or 0)
         fu = bool(js.get("follow_up", False)) and has_prior and score >= 0.70
         aug = norm(js.get("augmented_query","")) or query
         reason = js.get("reason","")
-        return ResolvedContext(follow_up=fu, reason=reason, augmented_query=aug, score=score, brief=brief, prior_docs=pd)
+        if not fu:  # ensure safety
+            action, paper_index = "normal", 0
+        return ResolvedContext(follow_up=fu, reason=reason, augmented_query=aug, score=score,
+                               action=action, paper_index=paper_index, brief=brief, prior_docs=pd)
     except Exception:
-        # Token-cheap, safe default: treat as new query
-        return ResolvedContext(follow_up=False, reason="intent-fallback", augmented_query=query, score=0.0, brief=brief, prior_docs=pd)
+        # regex fallback for critical intents (token-cheap)
+        ql = norm(query).lower()
+        action, pidx = "normal", 0
+        if has_prior and ("summarize" in ql or "tl;dr" in ql or "abstract" in ql):
+            action = "summarize_prior"
+        m = re.search(r"\bpaper\s*(\d+)\b", ql) or re.search(r"\b(1st|first|2nd|second|3rd|third)\b.*\b(paper|study|trial|reference)\b", ql)
+        if has_prior and m:
+            map_ord = {"first":1,"1st":1,"second":2,"2nd":2,"third":3,"3rd":3}
+            pidx = int(m.group(1)) if m and m.group(1).isdigit() else map_ord.get(m.group(1), 0)
+            action = "paper_detail" if pidx>0 else action
+        return ResolvedContext(follow_up=(action!="normal"), reason="intent-fallback", augmented_query=query, score=0.0,
+                               action=action, paper_index=pidx, brief=brief, prior_docs=pd)
 
 # ================= evidence + summary =================
 def evidence_pack(docs, cap=5):
@@ -762,25 +768,64 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
     t0 = time.perf_counter()
     q = norm(query); lo, hi = time_tags(q); ex = parse_not(q)
 
-    # Guardrail (hard gate for NEW queries)
-    guard = guardrail_domain(q)
-    if not guard.get("domain_relevant", False):
-        return _guardrail_payload([], lo, hi, ex, [], guard.get("reason",""))
-
-    # Resolve history intent (requires prior docs and score threshold)
+    # 1) Resolve intent FIRST
     ctx = resolve_context(q, history)
+
+    # 2) Guardrail only for NEW queries; for follow-ups we either use prior docs or guard on augmented text
+    if not ctx.follow_up:
+        guard = guardrail_domain(q)
+        if not guard.get("domain_relevant", False):
+            return _guardrail_payload([], lo, hi, ex, [], guard.get("reason",""))
+
     q_eff = ctx.augmented_query if ctx.follow_up else q
 
-    # Allow direct PMID(s) short-circuit
+    # special follow-up actions that rely on prior docs (no retrieval needed)
+    if ctx.follow_up and ctx.prior_docs and ctx.action in ("summarize_prior", "paper_detail"):
+        used_docs: List[Doc] = []
+        if ctx.action == "summarize_prior":
+            used_docs = ctx.prior_docs[:CFG.summary.top_docs_for_pack]
+        elif ctx.action == "paper_detail" and 1 <= ctx.paper_index <= len(ctx.prior_docs):
+            used_docs = [ctx.prior_docs[ctx.paper_index - 1]]
+        else:
+            used_docs = ctx.prior_docs[:CFG.summary.top_docs_for_pack]
+
+        t_sum_start = time.perf_counter()
+        summary_obj = summarize_with_context(q, used_docs, exact_flag=(len(used_docs)==1), role=role,
+                                             history_brief=ctx.brief, prior_docs=ctx.prior_docs)
+        t_sum_end = time.perf_counter()
+
+        return {
+            "docs": [{**asdict(d), "url": pmid_url(d.pmid)} for d in used_docs],
+            "summary": summary_obj,
+            "plan": {"chunks": []},
+            "time_tags": [lo, hi],
+            "exclusions": ex,
+            "booleans": [],
+            "intent": {"follow_up": ctx.follow_up, "reason": ctx.reason, "score": round(ctx.score,3),
+                       "action": ctx.action, "paper_index": ctx.paper_index,
+                       "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief},
+            "timings": {
+                "retrieve_ms": 0,
+                "summarize_ms": int((t_sum_end - t_sum_start)*1000),
+            },
+        }
+
+    # 3) Normal retrieval for standalone or contextualized follow-up
+    # optional: guard on augmented text (defensive, but permissive)
+    if ctx.follow_up:
+        g2 = guardrail_domain(q_eff)
+        if not g2.get("domain_relevant", True):
+            # still allow, but with ultra-relaxed boolean to try salvage
+            pass
+
     direct_pmids = _extract_pmids_from_query(q_eff)
 
-    # Planner
     try:
         plan = plan_tokens(q_eff)
     except Exception:
         plan = {"chunks":[t for t in tok(q_eff) if t.lower() not in STOP][:4],"anchors":{},"domain_relevant":True}
 
-    if not plan.get("domain_relevant", True):
+    if not plan.get("domain_relevant", True) and not ctx.follow_up:
         return _guardrail_payload(plan.get("chunks",[]), lo, hi, ex, [], "The query did not appear biomedical.")
 
     q_tokens = len(tok(q_eff))
@@ -792,8 +837,7 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
             merged[d.pmid] = d
 
     for v in variants:
-        if len(merged) >= CFG.retrieval.topk_titles:
-            break
+        if len(merged) >= CFG.retrieval.topk_titles: break
         tried_booleans.append({"label": v["label"], "query": v["query"]})
         try:
             if not esearch(v["query"], CFG.pubmed.retmax_probe): continue
@@ -820,7 +864,6 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
         except Exception:
             pass
 
-    # Merge prior docs ONLY if we truly decided it's a follow-up
     if ctx.follow_up and ctx.prior_docs:
         for d in ctx.prior_docs:
             if d.pmid not in merged:
@@ -831,9 +874,11 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
     used_docs = final_docs if final_docs else all_docs
 
     t_retrieve_end = time.perf_counter()
-
     if not used_docs:
         out = _guardrail_payload(plan.get("chunks",[]), lo, hi, ex, tried_booleans, "No PubMed items were found.")
+        out["intent"] = {"follow_up": ctx.follow_up, "reason": ctx.reason, "score": round(ctx.score,3),
+                         "action": ctx.action, "paper_index": ctx.paper_index,
+                         "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief}
         out["timings"] = {"retrieve_ms": int((t_retrieve_end - t0)*1000), "summarize_ms": 0}
         return out
 
@@ -852,14 +897,16 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
         "time_tags": [lo, hi],
         "exclusions": ex,
         "booleans": tried_booleans,
-        "intent": {"follow_up": ctx.follow_up, "reason": ctx.reason, "score": round(ctx.score,3), "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief},
+        "intent": {"follow_up": ctx.follow_up, "reason": ctx.reason, "score": round(ctx.score,3),
+                   "action": ctx.action, "paper_index": ctx.paper_index,
+                   "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief},
         "timings": {
             "retrieve_ms": int((t_retrieve_end - t0)*1000),
             "summarize_ms": int((t_sum_end - t_sum_start)*1000),
         },
     }
 
-# ================= FE compatibility shim (unchanged API) =================
+# ================= FE shim =================
 def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = False, history: Optional[Dict[str,Any]] = None) -> Tuple[str, Dict[str, Any]]:
     pipe = run_pipeline(question, role=role, history=history)
     summary = pipe.get("summary") or {}; docs = pipe.get("docs") or []
