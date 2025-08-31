@@ -134,7 +134,7 @@ def minmax(a: np.ndarray) -> np.ndarray:
     mn, mx = float(a.min()), float(a.max())
     return np.ones_like(a) * 0.5 if mx - mn < 1e-12 else (a - mn) / (mx - mn)
 
-# --- citation coercion helper (fix for invalid literal for int) ---
+# --- citation coercion helper (accepts strings like " [2] ") ---
 def _coerce_citations(raw, max_idx: int) -> List[int]:
     out: List[int] = []
     for x in (raw or []):
@@ -184,10 +184,8 @@ def _pplx(messages, model, search_mode=None, temp=None, maxtok=None) -> str:
     return (r.json().get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
 
 def _gemini(messages, temp=None, maxtok=None) -> str:
-    # Minimal REST call, text-only messages
     if not GEMINI_KEY:
         raise RuntimeError("Gemini API key missing.")
-    # Convert OpenAI-style messages → a single text prompt
     def to_text(msgs):
         parts = []
         for m in msgs:
@@ -211,19 +209,15 @@ def _gemini(messages, temp=None, maxtok=None) -> str:
         return ""
 
 def llm(messages, model="pplx-summary", search_mode=None, temp=None, maxtok=None) -> str:
-    """
-    Unified LLM entry: try Perplexity first; on failure or empty output, fall back to Gemini.
-    """
+    # Try PPLX first, then Gemini as a fallback.
     try:
         if model.startswith("pplx-"):
-            # Map aliases
             mdl = CFG.pplx.model_summary if model == "pplx-summary" else CFG.pplx.model_plan
             return _pplx(messages, mdl, search_mode=search_mode, temp=temp, maxtok=maxtok)
         else:
             return _pplx(messages, model, search_mode=search_mode, temp=temp, maxtok=maxtok)
     except Exception:
         pass
-    # Fallback to Gemini
     try:
         return _gemini(messages, temp=temp, maxtok=maxtok)
     except Exception:
@@ -263,10 +257,8 @@ def guardrail_domain(query: str) -> Dict[str, Any]:
         js = None
     if not js:
         words = [t for t in tok(query) if t.lower() not in STOP]
-        # crude heuristic fallback
-        has_med_kw = any(k in query.lower() for k in ["disease","drug","treatment","vaccine","risk","trial","symptom","diagnos","therap","covid","cancer"])
         two_words_cap = bool(re.match(r"^[A-Z][a-z]+\s+[A-Z][a-z]+$", query.strip()))
-        return {"domain_relevant": has_med_kw and len(words) >= 2 and not two_words_cap, "reason": "Heuristic fallback"}
+        return {"domain_relevant": len(words) >= 2 and not two_words_cap, "reason": "Heuristic fallback"}
     return {"domain_relevant": bool(js.get("domain_relevant", False)), "reason": str(js.get("reason",""))}
 
 # ================= planner =================
@@ -540,12 +532,24 @@ def _enrich_prior_docs(prior_docs: List[Doc]) -> List[Doc]:
     return prior_docs
 
 def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedContext:
+    # Default: citations ON for everything except "summarize"
+    default_include = True
+
     if not history:
-        return ResolvedContext(follow_up=False, reason="no-history", augmented_query=query, brief="", prior_docs=[])
+        # detect summarize/elaborate quickly via heuristics
+        ql = norm(query).lower()
+        mode = "summarize" if re.search(r"\b(summary|summarize|tl;dr|brief)\b", ql) else ("elaborate" if "elaborate" in ql or "explain" in ql else "default")
+        include_citations = default_include
+        if mode == "summarize" and not re.search(r"\bwith citations?\b", ql):
+            include_citations = False
+        if re.search(r"\bwithout citations?\b|\bno citations?\b", ql):
+            include_citations = False
+        return ResolvedContext(follow_up=False, reason="no-history", augmented_query=query, brief="", prior_docs=[],
+                               mode=mode, include_citations=include_citations)
+
     msgs = history.get("recent_messages") or []
     prior_docs_in = history.get("prior_docs") or []
 
-    # convert docs
     pd: List[Doc] = []
     for dd in prior_docs_in:
         d = _to_doc(dd)
@@ -554,21 +558,14 @@ def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedCon
 
     brief = _minify_messages(msgs)
 
-    # Try intent model (cheap), fallback to minimal heuristic
+    # LLM intent (cheap), robust defaults
     try:
         sys = textwrap.dedent("""
         Detect whether the latest user question is a FOLLOW-UP to the prior chat or a NEW standalone query, and whether the user asked to SUMMARIZE, ELABORATE, or DETAIL a numbered paper.
         Output STRICT JSON only with keys:
-        {
-          "follow_up": true|false,
-          "augmented_query": "≤15 words that resolves pronouns, else empty",
-          "reason": "≤12 words",
-          "mode": "default|summarize|elaborate|detail_paper",
-          "paper_index": 0,
-          "include_citations": true|false
-        }
-        Set include_citations=false only if the user asked for "without citations" or equivalent.
-        If user asked "explain/elaborate about the 1st/second paper", set mode="detail_paper" and paper_index accordingly.
+        {"follow_up": true|false, "augmented_query": "≤15 words", "reason": "≤12 words", "mode": "default|summarize|elaborate|detail_paper", "paper_index": 0, "include_citations": true|false }
+        - If the user says "without citations", set include_citations=false.
+        - For "summarize", include_citations=false unless the user explicitly asks "with citations".
         """).strip()
         user = json.dumps({
             "current_query": norm(query),
@@ -587,13 +584,21 @@ def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedCon
         if mode not in ("default","summarize","elaborate","detail_paper"):
             mode = "default"
         paper_index = int(js.get("paper_index") or 0)
-        include_citations = bool(js.get("include_citations", True))
+        include_citations = js.get("include_citations")
+        if include_citations is None:
+            include_citations = default_include
+            if mode == "summarize":
+                include_citations = False
         return ResolvedContext(follow_up=follow, reason=reason, augmented_query=aug, brief=brief,
-                               prior_docs=pd, mode=mode, paper_index=paper_index, include_citations=include_citations)
+                               prior_docs=pd, mode=mode, paper_index=paper_index, include_citations=bool(include_citations))
     except Exception:
-        ql = query.lower().strip()
-        mode = "summarize" if any(k in ql for k in ("summarize","tl;dr","brief","sum up")) else ("elaborate" if "elaborate" in ql else "default")
-        include_citations = not ("without citation" in ql or "no citation" in ql)
+        ql = norm(query).lower()
+        mode = "summarize" if any(k in ql for k in ("summarize","tl;dr","brief","sum up")) else ("elaborate" if any(k in ql for k in ("elaborate","explain")) else "default")
+        include_citations = default_include
+        if mode == "summarize" and not re.search(r"\bwith citations?\b", ql):
+            include_citations = False
+        if re.search(r"\bwithout citations?\b|\bno citations?\b", ql):
+            include_citations = False
         follow = any(w in ql.split() for w in ("it","that","those","they","this","these")) or ql.startswith(("and ","also ","what about","how about","same","ok","continue","more","next"))
         prev_topic = ""
         for m in reversed(msgs):
@@ -601,8 +606,8 @@ def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedCon
                 prev_topic = norm(m.get("content",""))[:120]
                 break
         aug = (prev_topic + " — " + query)[:180] if follow and prev_topic else query
-        return ResolvedContext(follow_up=follow, reason="heuristic", augmented_query=aug, brief=brief, prior_docs=pd,
-                               mode=mode, paper_index=0, include_citations=include_citations)
+        return ResolvedContext(follow_up=follow, reason="heuristic", augmented_query=aug, brief=brief,
+                               prior_docs=pd, mode=mode, paper_index=0, include_citations=include_citations)
 
 # ================= evidence + summary =================
 def _links_from_docs(docs, cap):
@@ -671,79 +676,6 @@ def summarize(query, docs, exact_flag=False, role: Optional[str]=None, include_c
                       "plain":""},
             "citation_links": links}
 
-# ---- context-aware summary (keeps JSON shape) ----
-def summarize_with_context(query: str, docs: List[Doc], exact_flag: bool, role: Optional[str],
-                           history_brief: str = "", prior_docs: Optional[List[Doc]] = None,
-                           include_citations: bool=True):
-    prior_docs = prior_docs or []
-    if not prior_docs:
-        return summarize(query, docs, exact_flag=exact_flag, role=role, include_citations=include_citations)
-
-    # Build small prior pack (A-indexed)
-    pcap = CFG.summary.prior_docs_for_pack
-    chosen = prior_docs[:pcap]
-    lines = []
-    links: Dict[str,str] = {}
-    for i, d in enumerate(chosen, 1):
-        tag = f"A{i}"
-        links[tag] = pmid_url(d.pmid)
-        head = f"[{tag}] PMID {d.pmid} ({d.year}) {d.journal} — {d.title} ({links[tag]})"
-        body = f"Abstract: {d.abstract[:CFG.summary.abstract_chars]}" if d.abstract else "Abstract: (not available)"
-        lines.append(f"{head}\n{body}")
-    prior_pack = ("PRIOR CONTEXT PACK\n" + "\n\n".join(lines)) if lines else ""
-
-    cap = CFG.summary.top_docs_for_pack
-    main_pack, main_links = evidence_pack(docs, cap=cap)
-    flavor = _role_flavor(role)
-    must_cite = "Every factual sentence must include bracket citations like [1][2] or [A1]. " if include_citations else "Do not include bracket citations. "
-
-    sys = ("Answer grounded to the provided packs only. Prefer the current EVIDENCE PACK; use PRIOR CONTEXT PACK only to maintain continuity (compare, clarify). "
-           "Respond with JSON only. " + must_cite + flavor)
-
-    schema = {"question":"string","answer":{"conclusion":"string","key_findings":"array","quality_and_limits":"array","evidence_citations":"array","evidence_notes":"object","plain":"string"}}
-
-    user = f"""CHAT BRIEF
-{history_brief or "(none)"}
-
-QUESTION
-{query}
-
-{main_pack}
-
-{prior_pack if prior_pack else ""}
-
-TASK
-Return MINIFIED JSON exactly in this schema (no prose):
-{json.dumps(schema,indent=2)}
-Cite from [1..{min(cap,len(docs))}] for current evidence; if you must reference prior context, use [A1..A{len(chosen)}].
-If a field is missing, write 'not reported'. {'Ensure every claim has bracket citations.' if include_citations else 'Do not include citations.'}
-"""
-
-    content = llm([{"role":"system","content":sys+" Return MINIFIED JSON only."},
-                   {"role":"user","content":user}],
-                  model="pplx-summary", search_mode=CFG.pplx.search_mode_summary, temp=0.0, maxtok=900)
-    js = json_from_text(content)
-
-    if js:
-        ans = js.get("answer") or {}
-        norm_cites: List[Any] = ans.get("evidence_citations") or []
-        numeric_only = []
-        for x in norm_cites:
-            m = re.search(r"\d+", str(x))
-            if m:
-                idx = int(m.group(0))
-                if 1 <= idx <= min(cap, len(docs)) and idx not in numeric_only:
-                    numeric_only.append(idx)
-        ans["evidence_citations"] = numeric_only if include_citations else []
-        ans["key_findings"] = [str(x) for x in (ans.get("key_findings") or [])]
-        ans["quality_and_limits"] = [str(x) for x in (ans.get("quality_and_limits") or [])]
-        ans["plain"] = str(ans.get("plain") or "")
-        js["answer"] = ans
-        js["citation_links"] = main_links | links
-        return js
-
-    return summarize(query, docs, exact_flag=exact_flag, role=role, include_citations=include_citations)
-
 # ---- plain modes (summarize / elaborate) ----
 def _plain_prompt(style: str, include_citations: bool, role: Optional[str]) -> str:
     tone = _role_flavor(role)
@@ -757,7 +689,6 @@ def _plain_prompt(style: str, include_citations: bool, role: Optional[str]) -> s
 def summarize_plain(query: str, docs: List[Doc], role: Optional[str], style: str,
                     history_brief: str = "", prior_docs: Optional[List[Doc]] = None,
                     include_citations: bool=True):
-    # Build pack and ask for plain text in 'answer.plain'
     cap = CFG.summary.top_docs_for_pack
     main_pack, links = evidence_pack(docs, cap=cap)
     prompt = _plain_prompt(style, include_citations, role)
@@ -781,7 +712,6 @@ def summarize_plain(query: str, docs: List[Doc], role: Optional[str], style: str
 def summarize_detail_paper(query: str, docs: List[Doc], role: Optional[str], include_citations: bool=True):
     if not docs:
         return {"question":query,"answer":{"plain":"No eligible PubMed items found.","conclusion":"","key_findings":[],"quality_and_limits":[],"evidence_citations":[]},"citation_links":{}}
-    # Use the first doc as the focal paper (caller hoists it when needed)
     d = docs[0]
     cap_links = _links_from_docs([d], cap=1)
     pack = f"EVIDENCE PACK\n[1] PMID {d.pmid} ({d.year}) {d.journal} — {d.title} ({pmid_url(d.pmid)})\nAbstract: {d.abstract[:CFG.summary.abstract_chars] or '(not available)'}"
@@ -887,16 +817,15 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
     t0 = time.perf_counter()
     q = norm(query); lo, hi = time_tags(q); ex = parse_not(q)
 
-    # Guardrail
-    guard = guardrail_domain(q)
-    if not guard.get("domain_relevant", False):
-        return _guardrail_payload([], lo, hi, ex, [], guard.get("reason",""))
-
-    # Check direct PMID(s) ask
-    direct_pmids = _extract_pmids_from_query(q)
-
-    # Resolve history intent
+    # Resolve history intent up front
     ctx = resolve_context(q, history)
+
+    # Guardrail ONLY blocks new, clearly non-biomedical queries
+    if not ctx.follow_up:
+        guard = guardrail_domain(q)
+        if not guard.get("domain_relevant", False):
+            return _guardrail_payload([], lo, hi, ex, [], guard.get("reason",""))
+
     q_eff = ctx.augmented_query if ctx.follow_up else q
 
     # Planner
@@ -905,14 +834,16 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
     except Exception:
         plan = {"chunks":[t for t in tok(q_eff) if t.lower() not in STOP][:4],"anchors":{},"domain_relevant":True}
 
-    if not plan.get("domain_relevant", True):
+    if not plan.get("domain_relevant", True) and not ctx.follow_up:
         return _guardrail_payload(plan.get("chunks",[]), lo, hi, ex, [], "The query did not appear biomedical.")
 
+    # Retrieval
     q_tokens = len(tok(q_eff))
     variants = compose(plan, lo, hi, ex, qlen=q_tokens)
     tried_booleans, merged = [], {}
 
-    # Short-circuit for explicit PMIDs
+    # Allow direct PMID(s)
+    direct_pmids = _extract_pmids_from_query(q_eff)
     if direct_pmids:
         for d in _fetch_docs_by_pmids(direct_pmids):
             merged[d.pmid] = d
@@ -940,13 +871,13 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
 
     if not merged:
         try:
-            fb = ultra_relaxed(q_eff, lo, hi, ex)
+            fb = ultra_relaxed(q_eff, lo, hi, [])
             tried_booleans.append({"label":"fallback_compact","query":fb})
             for d in retrieve(fb, q_eff, "fallback_compact"): merged[d.pmid] = d
         except Exception:
             pass
 
-    # Merge prior docs if follow-up
+    # Merge prior docs to keep continuity
     if ctx.follow_up and ctx.prior_docs:
         for d in ctx.prior_docs:
             if d.pmid not in merged:
@@ -961,9 +892,11 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
     if not used_docs:
         out = _guardrail_payload(plan.get("chunks",[]), lo, hi, ex, tried_booleans, "No PubMed items were found.")
         out["timings"] = {"retrieve_ms": int((t_retrieve_end - t0)*1000), "summarize_ms": 0}
+        out["intent"] = {"follow_up": ctx.follow_up, "reason": ctx.reason, "augmented_query": ctx.augmented_query,
+                         "chat_brief": ctx.brief, "mode": ctx.mode, "include_citations": ctx.include_citations}
         return out
 
-    # Choose summarizer by mode
+    # Summarization modes
     t_sum_start = time.perf_counter()
     if ctx.mode == "summarize":
         summary_obj = summarize_plain(q, used_docs, role=role, style="summary",
@@ -975,9 +908,12 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
                                       history_brief=(ctx.brief if ctx.follow_up else ""),
                                       prior_docs=(ctx.prior_docs if ctx.follow_up else []),
                                       include_citations=ctx.include_citations)
+    elif ctx.mode == "detail_paper":
+        # Use first doc as focal unless user’s paper_index can be mapped externally
+        summary_obj = summarize_detail_paper(q, used_docs[:1], role=role, include_citations=ctx.include_citations)
     else:
         summary_obj = summarize(q, used_docs, exact_flag=(len(used_docs)==1 and not direct_pmids), role=role,
-                                include_citations=True)
+                                include_citations=True)  # default: citations ON
     t_sum_end = time.perf_counter()
 
     return {
@@ -996,7 +932,7 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
         },
     }
 
-# ================= FE compatibility shim (unchanged API; internals updated) =================
+# ================= FE compatibility shim =================
 def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = False, history: Optional[Dict[str,Any]] = None) -> Tuple[str, Dict[str, Any]]:
     pipe = run_pipeline(question, role=role, history=history)
     summary = pipe.get("summary") or {}; docs = pipe.get("docs") or []
@@ -1009,9 +945,13 @@ def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = 
 
     if isinstance(summary, dict) and "answer" in summary:
         a = summary["answer"] or {}
-        # honor plain answer if present
+        # If a plain answer is present (summarize / elaborate / detail), prefer it.
         if (a.get("plain") or "").strip():
             assistant_text = a.get("plain").strip()
+            cites = a.get("evidence_citations") or []
+            links = {str(k): v for k, v in (summary.get("citation_links") or {}).items()}
+            if cites:
+                assistant_text += "\n\nCitations:\n" + "\n".join([f"{i}. {links.get(str(i),'')}" for i in cites])
         else:
             conclusion = (a.get("conclusion") or "").strip()
             kf = _list_lines(a.get("key_findings") or [])
