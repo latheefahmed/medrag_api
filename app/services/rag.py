@@ -40,8 +40,8 @@ class PubMedCfg:
     tool: str = "medrag_rag_fast"
     sleep_no_key: float = 0.36
     sleep_with_key: float = 0.12
-    retmax_probe: int = 15
-    retmax_main: int = 40
+    retmax_probe: int = 15      # probe fewer
+    retmax_main: int = 40       # pull fewer IDs overall
     timeout: float = 60.0
 
 @dataclass
@@ -52,12 +52,12 @@ class RankCfg:
     w_bm25: float = 0.45
     w_bonus: float = 0.05
     mmr_lambda: float = 0.70
-    mmr_take: int = 10
+    mmr_take: int = 10          # only consider top 10 for MMR
 
 @dataclass
 class RetrievalCfg:
-    topk_titles: int = 12
-    final_take: int = 10
+    topk_titles: int = 12        # re-rank fewer titles via BM25
+    final_take: int = 10         # final docs handed to summary
     min_final: int = 5
 
 @dataclass
@@ -94,9 +94,9 @@ def _session():
         max_retries=Retry(
             total=5, connect=3, read=3, backoff_factor=0.6,
             status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods={"GET", "POST"},
+            allowed_methods={"GET", "POST"}
         ),
-        pool_connections=20, pool_maxsize=40,
+        pool_connections=20, pool_maxsize=40
     )
     s.mount("https://", ad); s.mount("http://", ad)
     s.headers.update({"User-Agent": f'{CFG.pubmed.tool}/1.0 ({CFG.pubmed.email})'})
@@ -123,8 +123,9 @@ def minmax(a: np.ndarray) -> np.ndarray:
     mn, mx = float(a.min()), float(a.max())
     return np.ones_like(a) * 0.5 if mx - mn < 1e-12 else (a - mn) / (mx - mn)
 
-# --- citation coercion helper (robust) ---
+# --- citation coercion helper (fix for invalid literal for int) ---
 def _coerce_citations(raw, max_idx: int) -> List[int]:
+    """Turn ['[1] PMID 40274424', 2, '3', 'ref 4'] into [1,2,3,4], unique, and clamp to [1..max_idx]."""
     out: List[int] = []
     for x in (raw or []):
         if isinstance(x, (int, float)):
@@ -188,16 +189,12 @@ def json_from_text(t):
         except Exception: return None
 
 # ================= guardrails =================
-def guardrail_domain_is_biomed(query: str) -> Dict[str, Any]:
-    """
-    Return domain_relevant=True if the query is biomedical/clinical.
-    We'll use this to explicitly BLOCK biomedical content.
-    """
+def guardrail_domain(query: str) -> Dict[str, Any]:
     sys = textwrap.dedent("""
-    You are a strict gatekeeper. Output STRICT JSON only.
-    Mark "domain_relevant": true if and only if the query is biomedical/clinical/public health,
-    including diseases, diagnostics, interventions, pharmacology, physiology, epidemiology,
-    or any request that would reasonably require biomedical knowledge or literature.
+    You are a strict gatekeeper for a PubMed-backed biomedical QA system.
+    Output STRICT JSON only.
+    Consider a query "domain_relevant" ONLY if it primarily concerns human biomedical/clinical research,
+    diseases, diagnostics, interventions, pharmacology, physiology, epidemiology, or public health.
     JSON schema: {"domain_relevant": true, "reason": "short justification"}
     """).strip()
     user = json.dumps({"query": norm(query)}, ensure_ascii=False)
@@ -213,35 +210,42 @@ def guardrail_domain_is_biomed(query: str) -> Dict[str, Any]:
     except Exception:
         js = None
     if not js:
-        # fallback heuristic: look for common medical tokens
-        words = [t.lower() for t in tok(query)]
-        medish = {"patient","randomized","drug","dose","trial","disease","therapy","symptom","clinical","risk",
-                  "mortality","morbidity","cohort","prospective","retrospective","meta","guideline","screening"}
-        return {"domain_relevant": any(w in medish for w in words), "reason": "Heuristic fallback"}
+        words = [t for t in tok(query) if t.lower() not in STOP]
+        return {"domain_relevant": len(words) >= 2, "reason": "Heuristic fallback"}
     return {"domain_relevant": bool(js.get("domain_relevant", False)), "reason": str(js.get("reason",""))}
 
 # ================= planner =================
 def plan_tokens(query):
     sys = textwrap.dedent("""
-    Output STRICT JSON only. Goal: minimal PubMed tokens (≤3 words).
-    Group terms under Disease/Intervention/Comparator/Outcome/Population/Context.
-    JSON: {"chunks":[],"anchors":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[],"Population":[],"Context":[]}}
+    You are a biomedical retrieval planner. Output STRICT JSON only.
+    GOAL: minimal PubMed tokens (≤3 words). Group: Disease, Intervention, Comparator, Outcome, Population, Context.
+    If Intervention & Comparator exist → must_pair=true. Include boolean "domain_relevant".
+    JSON: {"chunks":[],"anchors":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[],"Population":[],"Context":[]},"mesh_terms":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[]},"must_pair":{"require_intervention_vs_comparator":false},"domain_relevant":true}
     """).strip()
     content = pplx(
         [{"role":"system","content":sys},
          {"role":"user","content":json.dumps({"query": norm(query)}, ensure_ascii=False)}],
-        "sonar-pro", "academic", temp=0.0, maxtok=400
+        CFG.pplx.model_plan, CFG.pplx.search_mode_plan, temp=0.0, maxtok=500
     )
     js = json_from_text(content)
     if not js:
         toks = [t for t in tok(query) if t.lower() not in STOP]
         return {"chunks": list(dict.fromkeys(toks[:6])),
-                "anchors": {k: [] for k in ["Disease","Intervention","Comparator","Outcome","Population","Context"]}}
+                "anchors": {k: [] for k in ["Disease","Intervention","Comparator","Outcome","Population","Context"]},
+                "mesh_terms": {k: [] for k in ["Disease","Intervention","Comparator","Outcome"]},
+                "must_pair": {"require_intervention_vs_comparator": False},
+                "domain_relevant": True}
     nl = lambda xs, n: list(dict.fromkeys([norm(str(v)).lower() for v in (xs or []) if v and len(str(v).split()) <= 3]))[:n]
     js["chunks"] = nl(js.get("chunks", []), 6)
     for k in ["Disease","Intervention","Comparator","Outcome","Population","Context"]:
         js.setdefault("anchors", {}).setdefault(k, [])
         js["anchors"][k] = nl(js["anchors"][k], 8)
+    for k in ["Disease","Intervention","Comparator","Outcome"]:
+        js.setdefault("mesh_terms", {}).setdefault(k, [])
+        js["mesh_terms"][k] = nl(js["mesh_terms"][k], 8)
+    mp = js.get("must_pair") or {}
+    js["must_pair"] = {"require_intervention_vs_comparator": bool(mp.get("require_intervention_vs_comparator"))}
+    js["domain_relevant"] = bool(js.get("domain_relevant", True))
     return js
 
 # ================= boolean composer =================
@@ -407,6 +411,7 @@ def fuse_mmr(query, docs):
     bon = np.array([bonus_score(d.pubtypes) for d in docs], dtype=np.float32)
     bm25 = np.array([(d.scores or {}).get("bm25_group", 0.0) for d in docs], dtype=np.float32)
 
+    # ---- corrected fusion: include real BM25 instead of bonus twice ----
     fused = (
         CFG.rank.w_cos  * minmax(cos)  +
         CFG.rank.w_bm25 * minmax(bm25) +
@@ -428,7 +433,7 @@ def fuse_mmr(query, docs):
         d.scores = {**(d.scores or {}), "cos": float(cos[i]), "bonus": float(bon[i]), "fused_raw": float(fused[i])}
     return [dtop[i] for i in picks]
 
-# ================= summaries =================
+# ================= evidence + summary =================
 def evidence_pack(docs, cap=5):
     chosen = docs[:cap]; idx2url = {}; lines = []
     for i, d in enumerate(chosen, 1):
@@ -446,108 +451,53 @@ def _role_flavor(role: Optional[str]) -> str:
         return "Use a technical tone; emphasize design, endpoints, estimates, and limits."
     return "Use clear, precise prose without bullets or markdown."
 
-def _structured_block_summary(message: str) -> Dict[str, Any]:
-    """
-    Produce a fully-structured summary object that FE can render even when blocked.
-    """
-    return {
-        "question": "",
-        "answer": {
-            "simple_summary": message,
-            "what_was_studied": "",
-            "conclusion": message,
-            "key_findings": [],
-            "quality_and_limits": ["Blocked by policy: biomedical queries are not allowed."],
-            "evidence_citations": [],
-        },
-        "citation_links": {},
-    }
-
 def summarize(query, docs, exact_flag=False, role: Optional[str]=None):
     if not docs:
-        return {
-            "question": query,
-            "answer": {
-                "simple_summary": "No eligible literature found.",
-                "what_was_studied": "not reported",
-                "conclusion": "No eligible PubMed items found.",
-                "key_findings": [],
-                "quality_and_limits": ["Try broadening terms or removing exclusions."],
-                "evidence_citations": [],
-            },
-            "citation_links": {}
-        }
+        return {"question":query,"answer":{"conclusion":"No eligible PubMed items found.","key_findings":[],"quality_and_limits":["Try broadening filters or removing exclusions."],"evidence_citations":[]}, "citation_links":{}}
 
-    cap = 5
+    cap = CFG.summary.top_docs_for_pack
     pack, links = evidence_pack(docs, cap=cap)
 
-    flavor = (
-        "Every factual sentence must include bracket citations like [1][2]. "
-        "Start with 'simple_summary' (plain-English TL;DR). "
-        "Include 'what_was_studied' describing designs/populations/endpoints. "
-        "Do not use bullets or markdown. "
-    )
+    flavor = "Every factual sentence must include bracket citations like [1][2]. Do not use asterisks, dashes, bullets, or markdown anywhere. "
     if exact_flag: flavor += "Treat the single paper as an exact match. "
     flavor += _role_flavor(role)
 
     sys = ("Use ONLY the EVIDENCE PACK; do not browse. Prefer RCTs/meta-analyses/guidelines. Respond with JSON only. " + flavor)
-    schema = {
-        "question":"string",
-        "answer":{
-            "simple_summary":"string",
-            "what_was_studied":"string",
-            "conclusion":"string",
-            "key_findings":"array",
-            "quality_and_limits":"array",
-            "evidence_citations":"array",
-            "evidence_notes":"object"
-        }
-    }
-    user = f"QUESTION\n{query}\n\n{pack}\n\nTASK\nReturn MINIFIED JSON exactly in this schema (no prose):\n{json.dumps(schema,indent=2)}\nIf a field is missing, write 'not reported'. Ensure every claim has bracket citations."
+    schema = {"question":"string","answer":{"conclusion":"string","key_findings":"array","quality_and_limits":"array","evidence_citations":"array","evidence_notes":"object"}}
+    user = f"QUESTION\n{query}\n\n{pack}\n\nTASK\nReturn MINIFIED JSON exactly in this schema (no prose):\n{json.dumps(schema,indent=2)}\nIf a field is missing in EVIDENCE PACK, write 'not reported'. Ensure every claim has bracket citations."
 
     try:
-        content = pplx(
-            [{"role":"system","content":sys+" Return MINIFIED JSON only."},
-             {"role":"user","content":user}],
-            CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=900
-        )
+        content = pplx([{"role":"system","content":sys+" Return MINIFIED JSON only."},
+                        {"role":"user","content":user}],
+                       CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=900)
         js = json_from_text(content)
         if not js:
-            content2 = pplx(
-                [{"role":"system","content":sys},
-                 {"role":"user","content":user}],
-                CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=900
-            )
+            content2 = pplx([{"role":"system","content":sys},
+                             {"role":"user","content":user}],
+                            CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=900)
             js = json_from_text(content2)
     except Exception:
         js = None
 
     if js:
+        # ---- sanitize/normalize to prevent int-cast errors downstream ----
         ans = js.get("answer") or {}
         raw_cites = ans.get("evidence_citations") or js.get("evidence_citations") or []
         ans["evidence_citations"] = _coerce_citations(raw_cites, max_idx=min(cap, len(docs)))
         ans["key_findings"] = [str(x) for x in (ans.get("key_findings") or [])]
         ans["quality_and_limits"] = [str(x) for x in (ans.get("quality_and_limits") or [])]
-        ans["simple_summary"] = str(ans.get("simple_summary") or "")
-        ans["what_was_studied"] = str(ans.get("what_was_studied") or "")
         js["answer"] = ans
         js["citation_links"] = links
         return js
 
     cites = list(range(1, min(cap, len(docs)) + 1))
-    return {
-        "question": query,
-        "answer": {
-            "simple_summary": "Automatic fallback summary.",
-            "what_was_studied": "not reported",
-            "conclusion": "See synthesized findings from the evidence pack [1].",
-            "key_findings": [f"See items {cites} for key outcomes."],
-            "quality_and_limits": ["Automatic fallback summary; verify primary sources."],
-            "evidence_citations": cites
-        },
-        "citation_links": links,
-        "note": "Fallback summary used."
-    }
+    return {"question":query,
+            "answer":{"conclusion":"See synthesized findings from the evidence pack [1].",
+                      "key_findings":[f"See items {cites} for key outcomes."],
+                      "quality_and_limits":["Automatic fallback summary; verify primary sources."],
+                      "evidence_citations": cites},
+            "citation_links": links,
+            "note":"Fallback summary used."}
 
 # ================= helpers =================
 def time_tags(q):
@@ -585,49 +535,102 @@ def widen_variants(plan, q, lo, hi, ex):
     return chans
 
 # ================= pipeline =================
-def _blocked_biomed_payload(reason: str = "") -> Dict[str, Any]:
-    msg = "This assistant does not process biomedical/clinical queries."
-    if reason:
-        msg = f"{msg} {reason}".strip()
+def _guardrail_payload(chunks, lo, hi, ex, tried, reason: str = ""):
+    base = "We can’t search relevant keywords from our PubMed-backed database. Please try another query using healthcare or biomedical terminology."
+    msg = base if not reason else f"{base} {reason}".strip()
     return {
         "docs": [],
-        "summary": _structured_block_summary(msg),
-        "plan": {"chunks": []},
-        "time_tags": ["", ""],
-        "exclusions": [],
-        "booleans": [],
+        "summary": {"answer": {"conclusion": msg, "key_findings": [], "quality_and_limits": [], "evidence_citations": []},
+                    "citation_links": {}},
+        "plan": {"chunks": chunks},
+        "time_tags": [lo, hi],
+        "exclusions": ex,
+        "booleans": tried,
         "timings": {"retrieve_ms": 0, "summarize_ms": 0},
     }
 
-def _out_of_scope_payload() -> Dict[str, Any]:
-    msg = "This assistant is restricted and cannot provide literature answers for this non-biomedical topic."
-    return {
-        "docs": [],
-        "summary": _structured_block_summary(msg),
-        "plan": {"chunks": []},
-        "time_tags": ["", ""],
-        "exclusions": [],
-        "booleans": [],
-        "timings": {"retrieve_ms": 0, "summarize_ms": 0},
-    }
-
-def run_pipeline(query, role: Optional[str] = None) -> Dict[str, Any]:
+def run_pipeline(query, role: Optional[str] = None):
     t0 = time.perf_counter()
     q = norm(query); lo, hi = time_tags(q); ex = parse_not(q)
 
-    # HARD BLOCK: any biomedical/clinical/public health query is rejected.
-    guard = guardrail_domain_is_biomed(q)
-    if guard.get("domain_relevant", False):
-        return _blocked_biomed_payload(guard.get("reason",""))
+    # Guardrail
+    guard = guardrail_domain(q)
+    if not guard.get("domain_relevant", False):
+        return _guardrail_payload([], lo, hi, ex, [], guard.get("reason",""))
 
-    # For non-biomedical queries, we also avoid PubMed retrieval (out of scope).
+    # Planner
+    try:
+        plan = plan_tokens(q)
+    except Exception:
+        plan = {"chunks":[t for t in tok(q) if t.lower() not in STOP][:4],"anchors":{},"domain_relevant":True}
+
+    if not plan.get("domain_relevant", True):
+        return _guardrail_payload(plan.get("chunks",[]), lo, hi, ex, [], "The query did not appear biomedical.")
+
+    q_tokens = len(tok(q))
+    variants = compose(plan, lo, hi, ex, qlen=q_tokens)
+    tried_booleans, merged = [], {}
+
+    for v in variants:
+        tried_booleans.append({"label": v["label"], "query": v["query"]})
+        try:
+            if not esearch(v["query"], CFG.pubmed.retmax_probe): continue
+            for d in retrieve(v["query"], q, v["label"]): merged[d.pmid] = d
+            if len(merged) >= CFG.retrieval.topk_titles: break
+        except Exception:
+            continue
+
+    exact_single = len(merged) == 1
+
+    if len(merged) < CFG.retrieval.min_final:
+        for lv in widen_variants(plan, q, lo, hi, ex):
+            tried_booleans.append({"label": lv["label"], "query": lv["query"]})
+            try:
+                if not esearch(lv["query"], CFG.pubmed.retmax_probe): continue
+                for d in retrieve(lv["query"], q, lv["label"]):
+                    if d.pmid not in merged: merged[d.pmid] = d
+                if len(merged) >= CFG.retrieval.min_final: break
+            except Exception:
+                continue
+
+    if not merged:
+        try:
+            fb = ultra_relaxed(q, lo, hi, ex)
+            tried_booleans.append({"label":"fallback_compact","query":fb})
+            for d in retrieve(fb, q, "fallback_compact"): merged[d.pmid] = d
+        except Exception:
+            pass
+
+    all_docs = list(merged.values())
+    final_docs = fuse_mmr(q, all_docs) if all_docs else []
+    used_docs = final_docs if final_docs else all_docs
+
     t_retrieve_end = time.perf_counter()
-    out = _out_of_scope_payload()
-    out["timings"] = {"retrieve_ms": int((t_retrieve_end - t0)*1000), "summarize_ms": 0}
-    return out
 
-# =============== FE compatibility shim (unchanged function signature) ===============
-def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = False, history: Optional[Dict[str,Any]] = None) -> Tuple[str, Dict[str, Any]]:
+    if not used_docs:
+        out = _guardrail_payload(plan.get("chunks",[]), lo, hi, ex, tried_booleans, "No PubMed items were found.")
+        out["timings"] = {"retrieve_ms": int((t_retrieve_end - t0)*1000), "summarize_ms": 0}
+        return out
+
+    t_sum_start = time.perf_counter()
+    summary_obj = summarize(q, used_docs, exact_flag=exact_single, role=role)
+    t_sum_end = time.perf_counter()
+
+    return {
+        "docs": [{**asdict(d), "url": pmid_url(d.pmid)} for d in used_docs],
+        "summary": summary_obj,
+        "plan": {"chunks": plan.get("chunks", [])},
+        "time_tags": [lo, hi],
+        "exclusions": ex,
+        "booleans": tried_booleans,
+        "timings": {
+            "retrieve_ms": int((t_retrieve_end - t0)*1000),
+            "summarize_ms": int((t_sum_end - t_sum_start)*1000),
+        },
+    }
+
+# ================= FE compatibility shim (unchanged) =================
+def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = False) -> Tuple[str, Dict[str, Any]]:
     pipe = run_pipeline(question, role=role)
     summary = pipe.get("summary") or {}; docs = pipe.get("docs") or []
 
@@ -639,8 +642,6 @@ def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = 
 
     if isinstance(summary, dict) and "answer" in summary:
         a = summary["answer"] or {}
-        simple = (a.get("simple_summary") or "").strip()
-        studied = (a.get("what_was_studied") or "").strip()
         conclusion = (a.get("conclusion") or "").strip()
         kf = _list_lines(a.get("key_findings") or [])
         ql = _list_lines(a.get("quality_and_limits") or [])
@@ -648,9 +649,7 @@ def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = 
         links = {str(k): v for k, v in (summary.get("citation_links") or {}).items()}
 
         lines = []
-        if simple: lines += [f"Quick take (plain-English): {simple}", ""]
-        if conclusion: lines += [f"Brief answer: {conclusion}", ""]
-        if studied: lines += ["What these papers studied:", studied, ""]
+        if conclusion: lines += [conclusion, ""]
         if kf: lines += ["Key findings:", *kf, ""]
         if ql: lines += ["Quality and limitations:", *ql, ""]
         if cites:
@@ -678,13 +677,7 @@ def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = 
         "plan": {"chunks": (pipe.get("plan") or {}).get("chunks", []),
                  "time_tags": pipe.get("time_tags", []),
                  "exclusions": pipe.get("exclusions", [])},
-        "overview": {
-            "simple_summary": (summary.get("answer") or {}).get("simple_summary", "") if isinstance(summary, dict) else "",
-            "conclusion": (summary.get("answer") or {}).get("conclusion", "") if isinstance(summary, dict) else "",
-            "key_findings": (summary.get("answer") or {}).get("key_findings", []) if isinstance(summary, dict) else [],
-            "quality_and_limits": (summary.get("answer") or {}).get("quality_and_limits", []) if isinstance(summary, dict) else [],
-        },
+        "overview": None,
         "timings": pipe.get("timings") or {"retrieve_ms": 0, "summarize_ms": 0},
-        "intent": {},   # intentionally empty: no follow-up memory/intent
     }
     return assistant_text, right_pane

@@ -20,7 +20,6 @@ import app.services.rag as rag
 
 router = APIRouter(prefix="/ask", tags=["ask"])
 
-
 # --------- Accept both old/new FE payloads gracefully ----------
 class AskBody(BaseModel):
     session_id: Optional[str] = None
@@ -31,10 +30,17 @@ class AskBody(BaseModel):
     max_tokens: Optional[int] = 512
     role_override: Optional[str] = None
 
-
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
+def _iso_to_ms(s: Optional[str]) -> int:
+    if not s:
+        return _now_ms()
+    try:
+        s = s.replace("Z", "+00:00") if "Z" in s else s
+        return int(datetime.fromisoformat(s).timestamp() * 1000)
+    except Exception:
+        return _now_ms()
 
 def _mk_references_from_rightpane(rp: Dict[str, Any] | None) -> List[Dict[str, Any]]:
     if not rp:
@@ -54,7 +60,6 @@ def _mk_references_from_rightpane(rp: Dict[str, Any] | None) -> List[Dict[str, A
             "abstract": d.get("abstract"),
         })
     return [r for r in out if r.get("title") or r.get("pmid")]
-
 
 def _assistant_text_from_summary(summary: Dict[str, Any], docs: List[Dict[str, Any]]) -> str:
     if not isinstance(summary, dict) or "answer" not in summary:
@@ -92,13 +97,7 @@ def _assistant_text_from_summary(summary: Dict[str, Any], docs: List[Dict[str, A
             lines.append(f"[{idx}] {title}{(' - ' + url) if url else ''}")
     return "\n".join([s for s in lines if s is not None])
 
-
-def _right_pane_from_docs(
-    docs: List[Dict[str, Any]],
-    tried: List[Dict[str, str]],
-    timings: Dict[str, int],
-    overview=None,
-):
+def _right_pane_from_docs(docs: List[Dict[str, Any]], tried: List[Dict[str, str]], timings: Dict[str,int], overview=None):
     results = [{
         "pmid": d.get("pmid"),
         "title": d.get("title"),
@@ -114,9 +113,7 @@ def _right_pane_from_docs(
         "plan": {"chunks": [], "time_tags": [], "exclusions": []},
         "overview": overview,
         "timings": timings,
-        "intent": {},  # single-turn only (no follow-up memory)
     }
-
 
 @router.post("")
 async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
@@ -149,15 +146,13 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     user_msg = {"id": str(uuid4()), "role": "user", "content": question, "ts": _now_ms()}
     messages: List[Dict[str, Any]] = (sess.get("messages") or []) + [user_msg]
 
-    # ---------- RETRIEVAL + GUARDRAIL (single-turn only) ----------
+    # ---------- RETRIEVAL STAGE (quick) ----------
     t0 = time.perf_counter()
-    q = rag.norm(question)
-    lo, hi = rag.time_tags(q)
-    ex = rag.parse_not(q)
+    q = rag.norm(question); lo, hi = rag.time_tags(q); ex = rag.parse_not(q)
 
-    # domain guard: block non-biomedical early
     guard = rag.guardrail_domain(q)
     if not guard.get("domain_relevant", False):
+        # return a quick guardrail response
         right_pane = _right_pane_from_docs([], [], {"retrieve_ms": 0, "summarize_ms": 0}, overview={
             "conclusion": "The query didn’t look biomedical. Try clinical/biomedical terms.",
             "key_findings": [],
@@ -171,27 +166,22 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
             "references": [],
         }
         messages.append(assistant_msg)
-        update_session(session_id, user_id, {"messages": messages, "rightPane": right_pane})
+        updated = update_session(session_id, user_id, {"messages": messages, "rightPane": right_pane}) or {}
         return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane}
 
-    # plan + compose variants (no intent/augment, no history)
+    # plan + compose variants
     try:
         plan = rag.plan_tokens(q)
     except Exception:
-        plan = {"chunks": [t for t in rag.tok(q) if t.lower() not in rag.STOP][:4], "anchors": {}, "domain_relevant": True}
+        plan = {"chunks":[t for t in rag.tok(q) if t.lower() not in rag.STOP][:4],"anchors":{},"domain_relevant":True}
 
     variants = rag.compose(plan, lo, hi, ex, qlen=len(rag.tok(q)))
     tried_booleans, merged = [], {}
 
-    # allow direct PMID short-circuit
-    for pid in rag._extract_pmids_from_query(q):
-        for d in rag._fetch_docs_by_pmids([pid]):
-            merged[d.pmid] = d
-
     for v in variants:
         tried_booleans.append({"label": v["label"], "query": v["query"]})
         try:
-            if not rag.esearch(v["query"], rag.CFG.pubmed.retmax_probe):
+            if not rag.esearch(v["query"], rag.CFG.pubmed.retmax_probe):  # cheap probe
                 continue
             for d in rag.retrieve(v["query"], q, v["label"]):
                 merged[d.pmid] = d
@@ -204,7 +194,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
         for lv in rag.widen_variants(plan, q, lo, hi, ex):
             tried_booleans.append({"label": lv["label"], "query": lv["query"]})
             try:
-                if not rag.esearch(lv["query"], rag.CFG.pubmed.retmax_probe):
+                if not rag.esearch(lv["query"], rag.CFG.pubmed.retmax_probe):  # cheap probe
                     continue
                 for d in rag.retrieve(lv["query"], q, lv["label"]):
                     if d.pmid not in merged:
@@ -217,7 +207,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     if not merged:
         try:
             fb = rag.ultra_relaxed(q, lo, hi, ex)
-            tried_booleans.append({"label": "fallback_compact", "query": fb})
+            tried_booleans.append({"label":"fallback_compact","query":fb})
             for d in rag.retrieve(fb, q, "fallback_compact"):
                 merged[d.pmid] = d
         except Exception:
@@ -228,10 +218,10 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     used_docs = final_docs if final_docs else all_docs
 
     t_retrieve_end = time.perf_counter()
-    timings_now = {"retrieve_ms": int((t_retrieve_end - t0) * 1000), "summarize_ms": 0}
+    timings_now = {"retrieve_ms": int((t_retrieve_end - t0)*1000), "summarize_ms": 0}
 
     # prepare right pane (results only) + placeholder assistant message
-    docs_payload = [{
+    docs_payload = [{  # light dicts for right pane + references
         "pmid": d.pmid, "title": d.title, "journal": d.journal, "year": d.year,
         "url": rag.pmid_url(d.pmid), "scores": d.scores, "abstract": d.abstract
     } for d in used_docs]
@@ -242,35 +232,34 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     assistant_msg = {
         "id": str(uuid4()),
         "role": "assistant",
-        "content": "",  # will be filled by background summary
+        "content": "",  # empty for now; will be filled by background summary
         "ts": _now_ms(),
         "references": references_initial,
     }
     messages.append(assistant_msg)
 
+    # persist session with references immediately
     update_session(session_id, user_id, {
         "messages": messages,
         "meta": sess.get("meta") or {},
         "rightPane": right_pane_initial
     })
 
-    # ---------- SUMMARY STAGE (background; single-turn) ----------
-    exact_single = len(used_docs) == 1 and not rag._extract_pmids_from_query(q)
+    # ---------- SUMMARY STAGE (background) ----------
+    exact_single = len(merged) == 1
 
     def _finish_summary():
         t_sum_start = time.perf_counter()
         try:
             summary_obj = rag.summarize(q, used_docs, exact_flag=exact_single, role=role)
         except Exception as e:
-            summary_obj = {"answer": {"conclusion": f"(summary error) {str(e)[:200]}",
-                                      "key_findings": [], "quality_and_limits": [], "evidence_citations": []},
-                           "citation_links": {}}
+            summary_obj = {"answer":{"conclusion": f"(summary error) {str(e)[:200]}", "key_findings": [], "quality_and_limits": [], "evidence_citations": []}, "citation_links": {}}
         t_sum_end = time.perf_counter()
 
         assistant_text = _assistant_text_from_summary(summary_obj, docs_payload)
         refs = _mk_references_from_rightpane(right_pane_initial)
 
-        # update session: replace placeholder message content; enrich rightPane with overview + timings
+        # update session: replace the placeholder message content; enrich rightPane with overview + timings
         doc = get_session_by_id(session_id, user_id) or {}
         msgs = doc.get("messages") or []
         new_msgs = []
@@ -283,18 +272,22 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
             else:
                 new_msgs.append(m)
 
+        # merge overview + timings
         rp = doc.get("rightPane") or right_pane_initial
         rp["overview"] = {
-            "conclusion": (summary_obj.get("answer") or {}).get("conclusion", ""),
+            "conclusion": (summary_obj.get("answer") or {}).get("conclusion",""),
             "key_findings": (summary_obj.get("answer") or {}).get("key_findings", []),
             "quality_and_limits": (summary_obj.get("answer") or {}).get("quality_and_limits", []),
         }
         rp["timings"] = {
             "retrieve_ms": timings_now["retrieve_ms"],
-            "summarize_ms": int((t_sum_end - t_sum_start) * 1000),
+            "summarize_ms": int((t_sum_end - t_sum_start)*1000),
         }
-        # persist
-        update_session(session_id, user_id, {"messages": new_msgs, "rightPane": rp})
+
+        update_session(session_id, user_id, {
+            "messages": new_msgs,
+            "rightPane": rp
+        })
 
         try:
             create_log({
@@ -303,7 +296,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
                 "query": question,
                 "response": assistant_text[:8000],
                 "fetch_ms": int(timings_now["retrieve_ms"]),
-                "summarize_ms": int((t_sum_end - t_sum_start) * 1000),
+                "summarize_ms": int((t_sum_end - t_sum_start)*1000),
                 "n_results": int(len(used_docs)),
                 "ts": datetime.utcnow().isoformat(),
             })
