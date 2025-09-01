@@ -1,7 +1,7 @@
 # app/routers/ask.py
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from uuid import uuid4
@@ -33,6 +33,15 @@ class AskBody(BaseModel):
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
+def _iso_to_ms(s: Optional[str]) -> int:
+    if not s:
+        return _now_ms()
+    try:
+        s = s.replace("Z", "+00:00") if "Z" in s else s
+        return int(datetime.fromisoformat(s).timestamp() * 1000)
+    except Exception:
+        return _now_ms()
+
 def _mk_references_from_rightpane(rp: Dict[str, Any] | None) -> List[Dict[str, Any]]:
     if not rp:
         return []
@@ -52,18 +61,32 @@ def _mk_references_from_rightpane(rp: Dict[str, Any] | None) -> List[Dict[str, A
         })
     return [r for r in out if r.get("title") or r.get("pmid")]
 
+
 def _assistant_text_from_summary(summary: Dict[str, Any], docs: List[Dict[str, Any]]) -> str:
     if not isinstance(summary, dict) or "answer" not in summary:
         return "No summary generated."
     a = summary.get("answer") or {}
+
+    # New front-loaded sections
+    simple = (a.get("simple_summary") or "").strip()  # plain-English TL;DR
+    studied = (a.get("what_was_studied") or "").strip()  # what these papers did
+
     conclusion = (a.get("conclusion") or "").strip()
     kf = [s for s in (a.get("key_findings") or []) if s]
     ql = [s for s in (a.get("quality_and_limits") or []) if s]
     cites = a.get("evidence_citations") or []
 
     lines: List[str] = []
+    if simple:
+        lines.append(f"Quick take (plain-English): {simple}")
     if conclusion:
-        lines.append(conclusion)
+        if lines:
+            lines.append("")
+        lines.append(f"Brief answer: {conclusion}")
+    if studied:
+        lines.append("")
+        lines.append("What these papers studied:")
+        lines.append(studied)
     if kf:
         lines.append("")
         lines.append("Key findings:")
@@ -71,7 +94,7 @@ def _assistant_text_from_summary(summary: Dict[str, Any], docs: List[Dict[str, A
             lines.append(f"{i}. {item}")
     if ql:
         lines.append("")
-        lines.append("Quality and limitations:")
+        lines.append("Limitations & quality:")
         for i, item in enumerate(ql, 1):
             lines.append(f"{i}. {item}")
     if cites:
@@ -88,7 +111,14 @@ def _assistant_text_from_summary(summary: Dict[str, Any], docs: List[Dict[str, A
             lines.append(f"[{idx}] {title}{(' - ' + url) if url else ''}")
     return "\n".join([s for s in lines if s is not None])
 
-def _right_pane_from_docs(docs: List[Dict[str, Any]], tried: List[Dict[str, str]], timings: Dict[str,int], overview=None, intent=None):
+
+def _right_pane_from_docs(
+    docs: List[Dict[str, Any]],
+    tried: List[Dict[str, str]],
+    timings: Dict[str, int],
+    overview=None,
+    intent=None,
+):
     results = [{
         "pmid": d.get("pmid"),
         "title": d.get("title"),
@@ -100,14 +130,15 @@ def _right_pane_from_docs(docs: List[Dict[str, Any]], tried: List[Dict[str, str]
     } for d in docs]
     return {
         "results": results,
-        "booleans": [{"group": b.get("label",""), "query": b.get("query",""), "note": b.get("note")} for b in (tried or [])],
+        "booleans": [{"group": b.get("label", ""), "query": b.get("query", ""), "note": b.get("note")} for b in (tried or [])],
         "plan": {"chunks": [], "time_tags": [], "exclusions": []},
         "overview": overview,
         "timings": timings,
         "intent": intent or {},
     }
 
-def _collect_history_payload(sess_doc: Dict[str,Any]) -> Dict[str,Any]:
+
+def _collect_history_payload(sess_doc: Dict[str, Any]) -> Dict[str, Any]:
     """
     Build a compact history object for rag.resolve_context:
     - last ~3 turns of messages
@@ -115,8 +146,7 @@ def _collect_history_payload(sess_doc: Dict[str,Any]) -> Dict[str,Any]:
     """
     msgs = list(sess_doc.get("messages") or [])
     recent = msgs[-6:] if msgs else []  # ~3 turns
-    prior_docs: List[Dict[str,Any]] = []
-    # walk backward, collect references from the last two assistant messages
+    prior_docs: List[Dict[str, Any]] = []
     seen_pmids = set()
     cnt = 0
     for m in reversed(recent):
@@ -135,7 +165,7 @@ def _collect_history_payload(sess_doc: Dict[str,Any]) -> Dict[str,Any]:
                     "abstract": r.get("abstract"),
                     "score": r.get("score"),
                     "url": r.get("url"),
-                    "from_label": "history"
+                    "from_label": "history",
                 })
         cnt += 1
         if cnt >= 2:
@@ -145,8 +175,9 @@ def _collect_history_payload(sess_doc: Dict[str,Any]) -> Dict[str,Any]:
         "prior_docs": prior_docs[:8],
     }
 
+
 @router.post("")
-async def ask(body: AskBody, user=Depends(get_current_user)):
+async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
     # ---------- auth ----------
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -179,71 +210,216 @@ async def ask(body: AskBody, user=Depends(get_current_user)):
     user_msg = {"id": str(uuid4()), "role": "user", "content": question, "ts": _now_ms()}
     messages: List[Dict[str, Any]] = (sess.get("messages") or []) + [user_msg]
 
-    # ---------- RETRIEVAL + ANSWER (synchronous; fast) ----------
+    # ---------- RETRIEVAL STAGE (history-aware) ----------
     t0 = time.perf_counter()
-    q_norm = rag.norm(question); lo, hi = rag.time_tags(q_norm); ex = rag.parse_not(q_norm)
+    q = rag.norm(question)
+    lo, hi = rag.time_tags(q)
+    ex = rag.parse_not(q)
 
-    # intent + guardrail
-    ctx = rag.resolve_context(q_norm, history_payload)
-    mode = rag.detect_mode(q_norm)
-    guard = rag.guardrail_domain(q_norm)
-    if not guard.get("domain_relevant", False) and not ctx.follow_up:
-        right_pane = _right_pane_from_docs([], [], {"retrieve_ms": 0, "summarize_ms": 0}, overview={
-            "conclusion": "The query didn’t look biomedical. Try clinical/biomedical terms.",
-            "key_findings": [],
-            "quality_and_limits": []
-        }, intent={"follow_up": ctx.follow_up, "reason": ctx.reason, "mode": mode})
-        assistant_msg = {
-            "id": str(uuid4()),
-            "role": "assistant",
-            "content": "We can’t search relevant biomedical terms for this question.",
-            "ts": _now_ms(),
-            "references": [],
-        }
-        messages.append(assistant_msg)
-        update_session(session_id, user_id, {"messages": messages, "rightPane": right_pane})
-        return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane}
+    # Guardrails (probe ultra-relaxed once; otherwise return clean message)
+    guard = rag.guardrail_domain(q)
+    if not guard.get("domain_relevant", False):
+        try:
+            fb = rag.ultra_relaxed(q, lo, hi, ex)
+            if not rag.esearch(fb, 5):
+                right_pane = _right_pane_from_docs([], [], {"retrieve_ms": 0, "summarize_ms": 0}, overview={
+                    "simple_summary": "",
+                    "conclusion": "The query didn’t look biomedical. Try clinical/biomedical terms.",
+                    "key_findings": [],
+                    "quality_and_limits": [],
+                })
+                assistant_msg = {
+                    "id": str(uuid4()),
+                    "role": "assistant",
+                    "content": "Quick take (plain-English): This question doesn’t look biomedical.\n\nBrief answer: We can’t search relevant biomedical terms for this query.",
+                    "ts": _now_ms(),
+                    "references": [],
+                }
+                messages.append(assistant_msg)
+                update_session(session_id, user_id, {"messages": messages, "rightPane": right_pane})
+                return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane}
+        except Exception:
+            right_pane = _right_pane_from_docs([], [], {"retrieve_ms": 0, "summarize_ms": 0}, overview={
+                "simple_summary": "",
+                "conclusion": "The query didn’t look biomedical. Try clinical/biomedical terms.",
+                "key_findings": [],
+                "quality_and_limits": [],
+            })
+            assistant_msg = {
+                "id": str(uuid4()),
+                "role": "assistant",
+                "content": "Quick take (plain-English): This question doesn’t look biomedical.\n\nBrief answer: We can’t search relevant biomedical terms for this query.",
+                "ts": _now_ms(),
+                "references": [],
+            }
+            messages.append(assistant_msg)
+            update_session(session_id, user_id, {"messages": messages, "rightPane": right_pane})
+            return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane}
 
-    # pipeline
-    pipe = rag.run_pipeline(question, role=role, history=history_payload)
-    docs_payload = pipe.get("docs") or []
-    timings = pipe.get("timings") or {"retrieve_ms": 0, "summarize_ms": 0}
-    intent_payload = pipe.get("intent") or {}
-    right_pane = _right_pane_from_docs(docs_payload, pipe.get("booleans") or [], timings, overview=None, intent=intent_payload)
+    # intent resolution (history-aware)
+    ctx = rag.resolve_context(q, history_payload)
+    q_eff = ctx.augmented_query if ctx.follow_up else q
 
-    # answer text
-    summary_obj = pipe.get("summary") or {}
-    assistant_text = _assistant_text_from_summary(summary_obj, right_pane["results"])
-    references = _mk_references_from_rightpane(right_pane)
+    # plan + compose variants
+    try:
+        plan = rag.plan_tokens(q_eff)
+    except Exception:
+        plan = {"chunks": [t for t in rag.tok(q_eff) if t.lower() not in rag.STOP][:4], "anchors": {}, "domain_relevant": True}
+
+    variants = rag.compose(plan, lo, hi, ex, qlen=len(rag.tok(q_eff)))
+    tried_booleans: List[Dict[str, str]] = []
+    merged: Dict[str, Any] = {}
+
+    # allow direct PMID short-circuit
+    for pid in rag._extract_pmids_from_query(q_eff):
+        for d in rag._fetch_docs_by_pmids([pid]):
+            merged[d.pmid] = d
+
+    for v in variants:
+        tried_booleans.append({"label": v["label"], "query": v["query"]})
+        try:
+            if not rag.esearch(v["query"], rag.CFG.pubmed.retmax_probe):  # cheap probe
+                continue
+            for d in rag.retrieve(v["query"], q_eff, v["label"]):
+                merged[d.pmid] = d
+            if len(merged) >= rag.CFG.retrieval.topk_titles:
+                break
+        except Exception:
+            continue
+
+    if len(merged) < rag.CFG.retrieval.min_final:
+        for lv in rag.widen_variants(plan, q_eff, lo, hi, ex):
+            tried_booleans.append({"label": lv["label"], "query": lv["query"]})
+            try:
+                if not rag.esearch(lv["query"], rag.CFG.pubmed.retmax_probe):  # cheap probe
+                    continue
+                for d in rag.retrieve(lv["query"], q_eff, lv["label"]):
+                    if d.pmid not in merged:
+                        merged[d.pmid] = d
+                if len(merged) >= rag.CFG.retrieval.min_final:
+                    break
+            except Exception:
+                continue
+
+    if not merged:
+        try:
+            fb = rag.ultra_relaxed(q_eff, lo, hi, ex)
+            tried_booleans.append({"label": "fallback_compact", "query": fb})
+            for d in rag.retrieve(fb, q_eff, "fallback_compact"):
+                merged[d.pmid] = d
+        except Exception:
+            pass
+
+    # add history docs if follow-up
+    if ctx.follow_up and ctx.prior_docs:
+        for d in ctx.prior_docs:
+            if d.pmid not in merged:
+                merged[d.pmid] = d
+
+    all_docs = list(merged.values())
+    final_docs = rag.fuse_mmr(q_eff, all_docs) if all_docs else []
+    used_docs = final_docs if final_docs else all_docs
+
+    t_retrieve_end = time.perf_counter()
+    timings_now = {"retrieve_ms": int((t_retrieve_end - t0) * 1000), "summarize_ms": 0}
+
+    # prepare right pane (results only) + placeholder assistant message
+    docs_payload = [{
+        "pmid": d.pmid,
+        "title": d.title,
+        "journal": d.journal,
+        "year": d.year,
+        "url": rag.pmid_url(d.pmid),
+        "scores": d.scores,
+        "abstract": d.abstract,
+    } for d in used_docs]
+
+    intent_payload = {
+        "follow_up": ctx.follow_up,
+        "reason": ctx.reason,
+        "augmented_query": ctx.augmented_query,
+        "chat_brief": ctx.brief,
+    }
+    right_pane_initial = _right_pane_from_docs(docs_payload, tried_booleans, timings_now, overview=None, intent=intent_payload)
+    references_initial = _mk_references_from_rightpane(right_pane_initial)
 
     assistant_msg = {
         "id": str(uuid4()),
         "role": "assistant",
-        "content": assistant_text,
+        "content": "",  # to be filled by background summary
         "ts": _now_ms(),
-        "references": references,
+        "references": references_initial,
     }
     messages.append(assistant_msg)
 
     update_session(session_id, user_id, {
         "messages": messages,
         "meta": sess.get("meta") or {},
-        "rightPane": right_pane
+        "rightPane": right_pane_initial,
     })
 
-    # log (non-blocking best-effort)
-    try:
-        create_log({
-            "user_id": user_id,
-            "session_id": session_id,
-            "query": question,
-            "response": assistant_text[:8000],
-            "fetch_ms": int(timings.get("retrieve_ms") or 0),
-            "summarize_ms": int(timings.get("summarize_ms") or 0),
-            "n_results": int(len(docs_payload)),
-            "ts": datetime.utcnow().isoformat(),
-        })
-    except Exception as e:
-        print(f"[LOGS] failed to write log: {e!r}")
+    # ---------- SUMMARY STAGE (background; history-aware) ----------
+    exact_single = len(used_docs) == 1 and not rag._extract_pmids_from_query(q_eff)
 
-    return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane}
+    def _finish_summary():
+        t_sum_start = time.perf_counter()
+        try:
+            if ctx.follow_up and ctx.prior_docs:
+                summary_obj = rag.summarize_with_context(
+                    q, used_docs, exact_flag=exact_single, role=role,
+                    history_brief=ctx.brief, prior_docs=ctx.prior_docs
+                )
+            else:
+                summary_obj = rag.summarize(q, used_docs, exact_flag=exact_single, role=role)
+        except Exception as e:
+            summary_obj = {"answer": {"conclusion": f"(summary error) {str(e)[:200]}", "key_findings": [], "quality_and_limits": [], "evidence_citations": []}, "citation_links": {}}
+        t_sum_end = time.perf_counter()
+
+        assistant_text = _assistant_text_from_summary(summary_obj, docs_payload)
+        refs = _mk_references_from_rightpane(right_pane_initial)
+
+        # update session: replace placeholder message content; enrich rightPane with overview + timings
+        doc = get_session_by_id(session_id, user_id) or {}
+        msgs = doc.get("messages") or []
+        new_msgs = []
+        for m in msgs:
+            if m.get("id") == assistant_msg["id"]:
+                nm = dict(m)
+                nm["content"] = assistant_text
+                nm["references"] = refs
+                new_msgs.append(nm)
+            else:
+                new_msgs.append(m)
+
+        rp = doc.get("rightPane") or right_pane_initial
+        rp["overview"] = {
+            "simple_summary": (summary_obj.get("answer") or {}).get("simple_summary", ""),
+            "conclusion": (summary_obj.get("answer") or {}).get("conclusion", ""),
+            "key_findings": (summary_obj.get("answer") or {}).get("key_findings", []),
+            "quality_and_limits": (summary_obj.get("answer") or {}).get("quality_and_limits", []),
+        }
+        rp["timings"] = {
+            "retrieve_ms": timings_now["retrieve_ms"],
+            "summarize_ms": int((t_sum_end - t_sum_start) * 1000),
+        }
+        # persist
+        update_session(session_id, user_id, {"messages": new_msgs, "rightPane": rp})
+
+        try:
+            create_log({
+                "user_id": user_id,
+                "session_id": session_id,
+                "query": question,
+                "response": assistant_text[:8000],
+                "fetch_ms": int(timings_now["retrieve_ms"]),
+                "summarize_ms": int((t_sum_end - t_sum_start) * 1000),
+                "n_results": int(len(used_docs)),
+                "ts": datetime.utcnow().isoformat(),
+            })
+        except Exception as e:
+            print(f"[LOGS] failed to write log: {e!r}")
+
+    background_tasks.add_task(_finish_summary)
+
+    # return immediately with references and right pane results
+    return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane_initial}
