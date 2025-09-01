@@ -4,6 +4,7 @@
 import os, re, json, time, textwrap, requests, numpy as np
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Any, Optional, Tuple
+from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from rank_bm25 import BM25Okapi
@@ -32,6 +33,7 @@ class PPLXCfg:
     max_tokens: int = int(os.getenv("PPLX_MAX_TOKENS", "900"))
     search_mode_plan: Optional[str] = "academic"
     search_mode_summary: Optional[str] = None
+    search_mode_guard: Optional[str] = None  # we do not want guard to trigger web search
 
 @dataclass
 class PubMedCfg:
@@ -40,8 +42,8 @@ class PubMedCfg:
     tool: str = "medrag_rag_fast"
     sleep_no_key: float = 0.36
     sleep_with_key: float = 0.12
-    retmax_probe: int = 15      # probe fewer
-    retmax_main: int = 40       # pull fewer IDs overall
+    retmax_probe: int = 15
+    retmax_main: int = 40
     timeout: float = 60.0
 
 @dataclass
@@ -52,12 +54,14 @@ class RankCfg:
     w_bm25: float = 0.45
     w_bonus: float = 0.05
     mmr_lambda: float = 0.70
-    mmr_take: int = 10          # only consider top 10 for MMR
+    mmr_take: int = 10
+    cos_keep: float = 0.35         # topicality gate on normalized cosine
+    bm25_keep: float = 0.35        # topicality gate on normalized bm25
 
 @dataclass
 class RetrievalCfg:
-    topk_titles: int = 12        # re-rank fewer titles via BM25
-    final_take: int = 10         # final docs handed to summary
+    topk_titles: int = 12
+    final_take: int = 10
     min_final: int = 5
 
 @dataclass
@@ -112,7 +116,7 @@ STOP = set(("a an and or but the is are was were be been being of in on at to fo
             "another each any all some many much several few per via if then else since study studies trial trials effect effects "
             "impact impacts role outcomes results methods patients subjects adults children men women male female").split())
 
-norm = lambda s: re.sub(r"\s+", " ", (s or "").replace("–", "-").replace("—", "-")
+norm = lambda s: re.sub(r"\s+", " ", (s or "").replace("–", "-").replace("—", "-") \
                         .replace("“", "\"").replace("”", "\"").replace("’", "'").strip())
 tok = lambda s: re.findall(r"[A-Za-z0-9\-\+]+", (s or ""))
 q_ta = lambda p: f"\"{norm(p)}\"[Title/Abstract]" if " " in norm(p) else f"{norm(p)}[Title/Abstract]"
@@ -123,9 +127,7 @@ def minmax(a: np.ndarray) -> np.ndarray:
     mn, mx = float(a.min()), float(a.max())
     return np.ones_like(a) * 0.5 if mx - mn < 1e-12 else (a - mn) / (mx - mn)
 
-# --- citation coercion helper (fix for invalid literal for int) ---
 def _coerce_citations(raw, max_idx: int) -> List[int]:
-    """Turn ['[1] PMID 40274424', 2, '3', 'ref 4'] into [1,2,3,4], unique, and clamp to [1..max_idx]."""
     out: List[int] = []
     for x in (raw or []):
         if isinstance(x, (int, float)):
@@ -170,7 +172,8 @@ def pplx(messages, model, search_mode=None, temp=None, maxtok=None):
     body = {"model": model, "messages": messages, "stream": False,
             "temperature": CFG.pplx.temperature if temp is None else temp,
             "max_tokens": CFG.pplx.max_tokens if maxtok is None else maxtok}
-    if search_mode: body["search_mode"] = search_mode
+    if search_mode is not None:
+        body["search_mode"] = search_mode
     r = S.post(CFG.pplx.url, headers=h, json=body, timeout=CFG.pubmed.timeout)
     if r.status_code == 401: raise RuntimeError("Perplexity API key invalid.")
     r.raise_for_status()
@@ -188,39 +191,69 @@ def json_from_text(t):
         try: return json.loads(chunk)
         except Exception: return None
 
-# ================= guardrails =================
-def guardrail_domain(query: str) -> Dict[str, Any]:
-    sys = textwrap.dedent("""
-    You are a strict gatekeeper for a PubMed-backed biomedical QA system.
-    Output STRICT JSON only.
-    Consider a query "domain_relevant" ONLY if it primarily concerns human biomedical/clinical research,
-    diseases, diagnostics, interventions, pharmacology, physiology, epidemiology, or public health.
-    JSON schema: {"domain_relevant": true, "reason": "short justification"}
-    """).strip()
-    user = json.dumps({"query": norm(query)}, ensure_ascii=False)
+# ================= guard + intent via LLM (prompt-engineered) =================
+def classify_query(query: str, memory_exists: bool) -> Dict[str, Any]:
+    """
+    Returns STRICT JSON:
+    {
+      "domain_relevant": true|false,
+      "intent": "NEW_QUERY"|"SUMMARIZE_THREAD"|"EXPAND_CONCEPT"|"FOLLOWUP_CITATION"|"NON_BIOMEDICAL",
+      "confidence": 0..1,
+      "reason": "...",
+      "citation_index": null|int,
+      "pmid": null|string
+    }
+    Rules:
+      • domain_relevant == true ONLY for human biomedical/clinical topics (diseases, diagnostics, interventions,
+        pharmacology, physiology, epidemiology, public health, psychiatry, etc.).
+      • Common-knowledge, geography, politics, entertainment, sports, programming, finance, recipes, translation, etc.
+        are NOT biomedical → domain_relevant=false and intent="NON_BIOMEDICAL".
+      • FOLLOWUP_CITATION only if user references a prior citation with bracket index like [2] or a PMID number.
+      • SUMMARIZE_THREAD/EXPAND_CONCEPT only if user clearly asks to summarize/expand previous discussion.
+        Be conservative: if unclear, pick NEW_QUERY.
+      • If memory_exists=false and user asks for follow-up, still return intent but note in reason.
+    """
+    sys = "You are a strict gatekeeper and intent classifier for a PubMed-backed biomedical QA system. Output STRICT JSON only."
+    user = json.dumps({
+        "query": norm(query),
+        "memory_exists": bool(memory_exists)
+    }, ensure_ascii=False)
+
     try:
         content = pplx(
             [{"role":"system","content":sys},
-             {"role":"user","content":user}],
+             {"role":"user","content":textwrap.dedent(f"""
+             Classify the user's message per the rules above.
+             Only return valid minified JSON with the exact keys described.
+             """).strip() + "\n\n" + user}],
             CFG.pplx.model_guard,
-            CFG.pplx.search_mode_plan,
-            temp=0.0, maxtok=120
+            CFG.pplx.search_mode_guard,
+            temp=0.0, maxtok=220
         )
         js = json_from_text(content)
     except Exception:
         js = None
+
+    # Safe conservative default if LLM fails: treat as standalone biomedical query only if it looks long-ish
     if not js:
-        words = [t for t in tok(query) if t.lower() not in STOP]
-        return {"domain_relevant": len(words) >= 2, "reason": "Heuristic fallback"}
-    return {"domain_relevant": bool(js.get("domain_relevant", False)), "reason": str(js.get("reason",""))}
+        return {"domain_relevant": True, "intent": "NEW_QUERY", "confidence": 0.4, "reason": "Fallback", "citation_index": None, "pmid": None}
+    # normalize
+    js["domain_relevant"] = bool(js.get("domain_relevant", False))
+    js["intent"] = str(js.get("intent","NEW_QUERY")).upper()
+    js["confidence"] = float(js.get("confidence", 0.7))
+    js["citation_index"] = (int(js["citation_index"]) if isinstance(js.get("citation_index"), (int,float,str)) and str(js.get("citation_index")).isdigit() else None)
+    js["pmid"] = (str(js.get("pmid")).strip() or None) if js.get("pmid") else None
+    return js
 
 # ================= planner =================
 def plan_tokens(query):
     sys = textwrap.dedent("""
     You are a biomedical retrieval planner. Output STRICT JSON only.
-    GOAL: minimal PubMed tokens (≤3 words). Group: Disease, Intervention, Comparator, Outcome, Population, Context.
-    If Intervention & Comparator exist → must_pair=true. Include boolean "domain_relevant".
-    JSON: {"chunks":[],"anchors":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[],"Population":[],"Context":[]},"mesh_terms":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[]},"must_pair":{"require_intervention_vs_comparator":false},"domain_relevant":true}
+    GOAL: produce minimal PubMed tokens (≤3 words each) grouped by
+      Disease, Intervention, Comparator, Outcome, Population, Context.
+    If Intervention & Comparator exist → must_pair=true.
+    JSON:
+    {"chunks":[],"anchors":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[],"Population":[],"Context":[]},"mesh_terms":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[]},"must_pair":{"require_intervention_vs_comparator":false},"domain_relevant":true}
     """).strip()
     content = pplx(
         [{"role":"system","content":sys},
@@ -248,7 +281,7 @@ def plan_tokens(query):
     js["domain_relevant"] = bool(js.get("domain_relevant", True))
     return js
 
-# ================= boolean composer =================
+# ================= boolean composer (tight/robust) =================
 def _cluster(terms, k, thr):
     items = list(dict.fromkeys([norm(t).lower() for t in terms if t and t.lower() not in STOP]))
     if not items: return []
@@ -340,8 +373,11 @@ class Doc:
     scores: Dict[str, float]
     from_label: str = ""
 
-def bm25_scores_local(query, docs):
-    tokenized = [tok(d.lower()) for d in docs]
+def _bm25_texts(docs: List["Doc"]) -> List[str]:
+    return [((d.title or "") + " " + (d.abstract or "")).strip() for d in docs]
+
+def bm25_scores_over_texts(query: str, texts: List[str]) -> np.ndarray:
+    tokenized = [tok(t.lower()) for t in texts]
     bm = BM25Okapi(tokenized)
     return np.array(bm.get_scores(tok(query.lower())), dtype=np.float32)
 
@@ -370,7 +406,7 @@ def retrieve(boolean, nl, label):
         return []
     if not ids: return []
     sm = esummary(ids)
-    order, titles, meta = [], [], {}
+    order, meta = [], {}
     for pid in ids:
         e = sm.get(pid, {})
         ttl = (e.get("title") or "").strip()
@@ -379,27 +415,32 @@ def retrieve(boolean, nl, label):
         pd = e.get("pubdate", "")
         m = re.search(r"\b(19|20)\d{2}\b", pd)
         yr = int(m.group(0)) if m else 0
-        order.append(pid); titles.append(ttl); meta[pid] = {"title": ttl, "journal": jr, "year": yr}
-    if not titles: return []
-    b = bm25_scores_local(nl, titles)
-    idx = sorted(range(len(titles)), key=lambda i: -b[i])[:CFG.retrieval.topk_titles]
+        order.append(pid); meta[pid] = {"title": ttl, "journal": jr, "year": yr}
+    if not order: return []
     try:
-        abs_map = efetch([order[i] for i in idx])
+        abs_map = efetch(order[:CFG.retrieval.topk_titles])
     except Exception:
         abs_map = {}
-    out = []
-    for pid in [order[i] for i in idx]:
+
+    docs: List[Doc] = []
+    for pid in order[:CFG.retrieval.topk_titles]:
         m = meta[pid]; am = abs_map.get(pid, {})
-        out.append(Doc(
+        docs.append(Doc(
             pid, m["title"], m["journal"], m["year"],
             am.get("abstract", ""), am.get("pubtypes", []),
-            {"bm25_group": float(b[order.index(pid)])}, label
+            {"bm25_group": 0.0}, label
         ))
-    return out
+
+    # BM25 over title+abstract
+    texts = _bm25_texts(docs)
+    b = bm25_scores_over_texts(nl, texts)
+    for i, d in enumerate(docs):
+        d.scores["bm25_group"] = float(b[i])
+    return docs
 
 def fuse_mmr(query, docs):
     if not docs: return []
-    texts = [(d.title + " " + (d.abstract or "")).strip() for d in docs]
+    texts = _bm25_texts(docs)
 
     qv = try_get_query_vec(query)
     if qv is None:
@@ -411,16 +452,26 @@ def fuse_mmr(query, docs):
     bon = np.array([bonus_score(d.pubtypes) for d in docs], dtype=np.float32)
     bm25 = np.array([(d.scores or {}).get("bm25_group", 0.0) for d in docs], dtype=np.float32)
 
-    # ---- corrected fusion: include real BM25 instead of bonus twice ----
+    # fused
     fused = (
         CFG.rank.w_cos  * minmax(cos)  +
         CFG.rank.w_bm25 * minmax(bm25) +
         CFG.rank.w_bonus* minmax(bon)
     )
 
-    top = min(CFG.rank.mmr_take, len(docs))
-    order = np.argsort(-fused)[:top]
-    Dtop = D[order]; dtop = [docs[i] for i in order]
+    # topicality gate (drop off-topic outliers)
+    keep = (minmax(cos) >= CFG.rank.cos_keep) | (minmax(bm25) >= CFG.rank.bm25_keep)
+    idx_keep = [i for i, ok in enumerate(list(keep)) if ok]
+    if not idx_keep:
+        idx_keep = list(range(len(docs)))  # avoid empty set
+
+    Dk = D[idx_keep]
+    dk = [docs[i] for i in idx_keep]
+    fused_k = fused[idx_keep]
+
+    top = min(CFG.rank.mmr_take, len(dk))
+    order = np.argsort(-fused_k)[:top]
+    Dtop = Dk[order]; dtop = [dk[i] for i in order]
 
     try:
         for i, d in enumerate(dtop):
@@ -429,8 +480,9 @@ def fuse_mmr(query, docs):
         pass
 
     picks = mmr(qv, Dtop, CFG.rank.mmr_lambda, min(CFG.retrieval.final_take, top))
+    # annotate for diagnostics
     for i, d in enumerate(docs):
-        d.scores = {**(d.scores or {}), "cos": float(cos[i]), "bonus": float(bon[i]), "fused_raw": float(fused[i])}
+        d.scores = {**(d.scores or {}), "cos": float(cos[i]), "fused_raw": float(fused[i])}
     return [dtop[i] for i in picks]
 
 # ================= evidence + summary =================
@@ -480,7 +532,6 @@ def summarize(query, docs, exact_flag=False, role: Optional[str]=None):
         js = None
 
     if js:
-        # ---- sanitize/normalize to prevent int-cast errors downstream ----
         ans = js.get("answer") or {}
         raw_cites = ans.get("evidence_citations") or js.get("evidence_citations") or []
         ans["evidence_citations"] = _coerce_citations(raw_cites, max_idx=min(cap, len(docs)))
@@ -534,9 +585,57 @@ def widen_variants(plan, q, lo, hi, ex):
     chans.append({"label":"ultra_relaxed","query": ultra_relaxed(q, lo, hi, [])})
     return chans
 
+# ================= session memory helpers =================
+def build_session_memory(docs: List[Doc], summary_obj: Dict[str, Any]) -> Dict[str, Any]:
+    pack_docs = [{
+        "pmid": d.pmid, "title": d.title, "journal": d.journal, "year": d.year, "abstract": d.abstract
+    } for d in docs[:CFG.summary.top_docs_for_pack]]
+    idx_map = {str(i+1): d["pmid"] for i, d in enumerate(pack_docs)}
+    pmids = [d["pmid"] for d in pack_docs]
+
+    ans = (summary_obj or {}).get("answer") or {}
+    seeds = " ".join([ans.get("conclusion","")] + list(ans.get("key_findings") or []))
+    # light extraction (no keyword lists; just distinct tokens >3 chars not in STOP)
+    raw_terms = [t for t in tok(seeds) if len(t) > 3 and t.lower() not in STOP]
+    concepts = []
+    seen = set()
+    for t in raw_terms:
+        k = t.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        concepts.append({"name": t, "aliases": [], "pmids": pmids, "updated": datetime.utcnow().isoformat()})
+
+    return {
+        "thread_summary": ans.get("conclusion","").strip()[:600],
+        "concepts": concepts[:10],
+        "last_pack": {"pmids": pmids, "docs": pack_docs, "idx_map": idx_map},
+    }
+
+def _bm25_pick_from_memory(query: str, mem_docs: List[Dict[str, Any]], k: int = 10) -> List[Dict[str, Any]]:
+    if not mem_docs:
+        return []
+    texts = [((d.get("title") or "") + " " + (d.get("abstract") or "")).strip() for d in mem_docs]
+    bm = BM25Okapi([tok(x.lower()) for x in texts])
+    scores = bm.get_scores(tok(query.lower()))
+    idx = sorted(range(len(texts)), key=lambda i: -scores[i])[:min(k, len(texts))]
+    return [mem_docs[i] for i in idx]
+
+def summarize_from_memory(query: str, memory: Dict[str, Any], role: Optional[str] = None) -> Dict[str, Any]:
+    mp = (memory or {}).get("last_pack") or {}
+    mem_docs = mp.get("docs") or []
+    if not mem_docs:
+        return {"question": query, "answer": {"conclusion": "No session evidence to summarize.",
+                                              "key_findings": [], "quality_and_limits": [],
+                                              "evidence_citations": []}, "citation_links": {}}
+    top_docs = _bm25_pick_from_memory(query, mem_docs, k=CFG.retrieval.final_take)
+    as_docs = [Doc(d["pmid"], d["title"], d.get("journal",""), int(d.get("year") or 0),
+                   d.get("abstract",""), [], {"bm25_group": float(i+1)}) for i, d in enumerate(top_docs)]
+    return summarize(query, as_docs, exact_flag=(len(as_docs)==1), role=role)
+
 # ================= pipeline =================
 def _guardrail_payload(chunks, lo, hi, ex, tried, reason: str = ""):
-    base = "We can’t search relevant keywords from our PubMed-backed database. Please try another query using healthcare or biomedical terminology."
+    base = "This assistant answers biomedical questions only. Please rephrase with clinical/biomedical terms."
     msg = base if not reason else f"{base} {reason}".strip()
     return {
         "docs": [],
@@ -553,10 +652,10 @@ def run_pipeline(query, role: Optional[str] = None):
     t0 = time.perf_counter()
     q = norm(query); lo, hi = time_tags(q); ex = parse_not(q)
 
-    # Guardrail
-    guard = guardrail_domain(q)
-    if not guard.get("domain_relevant", False):
-        return _guardrail_payload([], lo, hi, ex, [], guard.get("reason",""))
+    # Guard (LLM-driven)
+    cls = classify_query(q, memory_exists=False)
+    if not cls.get("domain_relevant", False) or cls.get("intent") == "NON_BIOMEDICAL":
+        return _guardrail_payload([], lo, hi, ex, [], cls.get("reason",""))
 
     # Planner
     try:
@@ -629,7 +728,7 @@ def run_pipeline(query, role: Optional[str] = None):
         },
     }
 
-# ================= FE compatibility shim (unchanged) =================
+# ================= FE compatibility shim =================
 def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = False) -> Tuple[str, Dict[str, Any]]:
     pipe = run_pipeline(question, role=role)
     summary = pipe.get("summary") or {}; docs = pipe.get("docs") or []
