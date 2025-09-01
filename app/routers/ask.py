@@ -97,8 +97,7 @@ def _assistant_text_from_summary(summary: Dict[str, Any], docs: List[Dict[str, A
             lines.append(f"[{idx}] {title}{(' - ' + url) if url else ''}")
     return "\n".join([s for s in lines if s is not None])
 
-def _right_pane_from_docs(docs: List[Dict[str, Any]], tried: List[Dict[str, str]],
-                          timings: Dict[str,int], overview=None, intent=None):
+def _right_pane_from_docs(docs: List[Dict[str, Any]], tried: List[Dict[str, str]], timings: Dict[str,int], overview=None, intent=None):
     results = [{
         "pmid": d.get("pmid"),
         "title": d.get("title"),
@@ -120,13 +119,12 @@ def _right_pane_from_docs(docs: List[Dict[str, Any]], tried: List[Dict[str, str]
 def _collect_history_payload(sess_doc: Dict[str,Any]) -> Dict[str,Any]:
     """
     Build a compact history object for rag.resolve_context:
-    - last ~3 turns of messages
-    - prior docs from the last 1–2 assistant messages (their 'references')
+    - last ~3 turns of messages (≈ 2 prompts history emphasized)
+    - prior docs from the last two assistant messages (their 'references')
     """
     msgs = list(sess_doc.get("messages") or [])
     recent = msgs[-6:] if msgs else []  # ~3 turns
     prior_docs: List[Dict[str,Any]] = []
-    # walk backward, collect references from the last two assistant messages
     seen_pmids = set()
     cnt = 0
     for m in reversed(recent):
@@ -189,22 +187,21 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     user_msg = {"id": str(uuid4()), "role": "user", "content": question, "ts": _now_ms()}
     messages: List[Dict[str, Any]] = (sess.get("messages") or []) + [user_msg]
 
-    # ---------- RETRIEVAL STAGE (history-aware) ----------
+    # ---------- RETRIEVAL STAGE (history-aware only for summary) ----------
     t0 = time.perf_counter()
     q = rag.norm(question); lo, hi = rag.time_tags(q); ex = rag.parse_not(q)
 
-    # Guardrail (non-biomedical → block retrieval)
     guard = rag.guardrail_domain(q)
     if not guard.get("domain_relevant", False):
         right_pane = _right_pane_from_docs([], [], {"retrieve_ms": 0, "summarize_ms": 0}, overview={
             "conclusion": "The query didn’t look biomedical. Try clinical/biomedical terms.",
             "key_findings": [],
             "quality_and_limits": []
-        }, intent={"follow_up": False, "reason": "guardrail", "augmented_query": q, "mode": "summary", "reuse_prior": False})
+        })
         assistant_msg = {
             "id": str(uuid4()),
             "role": "assistant",
-            "content": "We can’t search for non-biomedical queries. Please rephrase with clinical/biomedical context.",
+            "content": "We can’t search relevant biomedical terms for this question.",
             "ts": _now_ms(),
             "references": [],
         }
@@ -212,7 +209,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
         update_session(session_id, user_id, {"messages": messages, "rightPane": right_pane})
         return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane}
 
-    # intent resolution (prompt-driven; no keyword triggers)
+    # intent resolution (affects summary only)
     ctx = rag.resolve_context(q, history_payload)
     q_eff = ctx.augmented_query if ctx.follow_up else q
 
@@ -225,7 +222,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     variants = rag.compose(plan, lo, hi, ex, qlen=len(rag.tok(q_eff)))
     tried_booleans, merged = [], {}
 
-    # direct PMID short-circuit
+    # allow direct PMID short-circuit
     for pid in rag._extract_pmids_from_query(q_eff):
         for d in rag._fetch_docs_by_pmids([pid]):
             merged[d.pmid] = d
@@ -233,7 +230,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     for v in variants:
         tried_booleans.append({"label": v["label"], "query": v["query"]})
         try:
-            if not rag.esearch(v["query"], rag.CFG.pubmed.retmax_probe):  # cheap probe
+            if not rag.esearch(v["query"], rag.CFG.pubmed.retmax_probe):
                 continue
             for d in rag.retrieve(v["query"], q_eff, v["label"]):
                 merged[d.pmid] = d
@@ -246,7 +243,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
         for lv in rag.widen_variants(plan, q_eff, lo, hi, ex):
             tried_booleans.append({"label": lv["label"], "query": lv["query"]})
             try:
-                if not rag.esearch(lv["query"], rag.CFG.pubmed.retmax_probe):  # cheap probe
+                if not rag.esearch(lv["query"], rag.CFG.pubmed.retmax_probe):
                     continue
                 for d in rag.retrieve(lv["query"], q_eff, lv["label"]):
                     if d.pmid not in merged:
@@ -265,7 +262,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
         except Exception:
             pass
 
-    # add / reuse history docs if follow-up
+    # add history docs if follow-up (affects only summary downstream)
     if ctx.follow_up and ctx.prior_docs:
         for d in ctx.prior_docs:
             if d.pmid not in merged:
@@ -274,14 +271,6 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     all_docs = list(merged.values())
     final_docs = rag.fuse_mmr(q_eff, all_docs) if all_docs else []
     used_docs = final_docs if final_docs else all_docs
-
-    # if classifier says reuse_prior, prioritize prior docs then re-rank
-    if ctx.follow_up and ctx.reuse_prior and ctx.prior_docs:
-        merged_for_reuse = {d.pmid: d for d in ctx.prior_docs}
-        for d in used_docs:
-            if d.pmid not in merged_for_reuse:
-                merged_for_reuse[d.pmid] = d
-        used_docs = rag.fuse_mmr(q_eff, list(merged_for_reuse.values()))
 
     t_retrieve_end = time.perf_counter()
     timings_now = {"retrieve_ms": int((t_retrieve_end - t0)*1000), "summarize_ms": 0}
@@ -292,22 +281,14 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
         "url": rag.pmid_url(d.pmid), "scores": d.scores, "abstract": d.abstract
     } for d in used_docs]
 
-    intent_payload = {
-        "follow_up": ctx.follow_up,
-        "reason": ctx.reason,
-        "augmented_query": ctx.augmented_query,
-        "chat_brief": ctx.brief,
-        "mode": ctx.mode,
-        "reuse_prior": ctx.reuse_prior,
-        "relation": ctx.relation,
-    }
+    intent_payload = {"follow_up": ctx.follow_up, "reason": ctx.reason, "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief}
     right_pane_initial = _right_pane_from_docs(docs_payload, tried_booleans, timings_now, overview=None, intent=intent_payload)
     references_initial = _mk_references_from_rightpane(right_pane_initial)
 
     assistant_msg = {
         "id": str(uuid4()),
         "role": "assistant",
-        "content": "",  # will be filled by background summary
+        "content": "",  # to be filled by background summary
         "ts": _now_ms(),
         "references": references_initial,
     }
@@ -326,12 +307,10 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
         t_sum_start = time.perf_counter()
         try:
             if ctx.follow_up and ctx.prior_docs:
-                summary_obj = rag.summarize_with_context(
-                    q, used_docs, exact_flag=exact_single, role=role,
-                    history_brief=ctx.brief, prior_docs=ctx.prior_docs, mode=ctx.mode
-                )
+                summary_obj = rag.summarize_with_context(q, used_docs, exact_flag=exact_single, role=role,
+                                                         history_brief=ctx.brief, prior_docs=ctx.prior_docs)
             else:
-                summary_obj = rag.summarize(q, used_docs, exact_flag=exact_single, role=role, mode=ctx.mode)
+                summary_obj = rag.summarize(q, used_docs, exact_flag=exact_single, role=role)
         except Exception as e:
             summary_obj = {"answer":{"conclusion": f"(summary error) {str(e)[:200]}", "key_findings": [], "quality_and_limits": [], "evidence_citations": []}, "citation_links": {}}
         t_sum_end = time.perf_counter()

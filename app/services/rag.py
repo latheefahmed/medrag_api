@@ -28,12 +28,21 @@ class PPLXCfg:
     model_plan: str = os.getenv("PPLX_MODEL_PLAN", "sonar-pro")
     model_summary: str = os.getenv("PPLX_MODEL_SUMMARY", "sonar-pro")
     model_guard: str = os.getenv("PPLX_MODEL_GUARD", "sonar-pro")
-    model_intent: str = os.getenv("PPLX_MODEL_INTENT", "sonar-mini")  # small, cheap
+    model_intent: str = os.getenv("PPLX_MODEL_INTENT", "sonar-mini")
     temperature: float = float(os.getenv("PPLX_TEMPERATURE", "0.15"))
     max_tokens: int = int(os.getenv("PPLX_MAX_TOKENS", "900"))
     search_mode_plan: Optional[str] = "academic"
     search_mode_summary: Optional[str] = None
     search_mode_intent: Optional[str] = None
+    timeout: float = float(os.getenv("PPLX_TIMEOUT", "60"))
+
+@dataclass
+class GeminiCfg:
+    # Flash for speed; configurable
+    url: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    temperature: float = float(os.getenv("GEMINI_TEMPERATURE", "0.0"))
+    max_output_tokens: int = int(os.getenv("GEMINI_MAX_TOKENS", "900"))
+    timeout: float = float(os.getenv("GEMINI_TIMEOUT", "60"))
 
 @dataclass
 class PubMedCfg:
@@ -77,6 +86,7 @@ class BooleanCfg:
 @dataclass
 class Cfg:
     pplx: PPLXCfg = field(default_factory=PPLXCfg)
+    gemini: GeminiCfg = field(default_factory=GeminiCfg)
     pubmed: PubMedCfg = field(default_factory=PubMedCfg)
     rank: RankCfg = field(default_factory=RankCfg)
     retrieval: RetrievalCfg = field(default_factory=RetrievalCfg)
@@ -88,6 +98,7 @@ CFG = Cfg()
 
 # env keys
 PPLX_KEY = os.getenv("PERPLEXITY_API_KEY", "").strip()
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 PUBMED_KEY = os.getenv("PUBMED_API_KEY", "").strip()
 
 # ================= http =================
@@ -161,35 +172,73 @@ def embed(texts: List[str]) -> np.ndarray:
     if not texts: return np.zeros((0, 768), dtype=np.float32)
     return _EMB.encode(texts, CFG.rank.embed_batch)
 
-def _sim(a: str, b: str) -> float:
-    """Cosine similarity of two short texts using the embedder (with cache on queries)."""
-    if not a or not b: return 0.0
-    av = try_get_query_vec(a)
-    if av is None:
-        av = _EMB.encode([a], CFG.rank.embed_batch)[0]
-        cache_query_vec(a, av)
-    bv = try_get_query_vec(b)
-    if bv is None:
-        bv = _EMB.encode([b], CFG.rank.embed_batch)[0]
-        cache_query_vec(b, bv)
-    return float(np.dot(av, bv))
-
-# ================= Perplexity =================
-def _need_pplx():
+# ================= LLM Core (PPLX first, Gemini fallback) =================
+def _pplx(messages, model, search_mode=None, temp=None, maxtok=None):
     if not PPLX_KEY:
-        raise RuntimeError("Perplexity API key missing or invalid (set PERPLEXITY_API_KEY).")
-
-def pplx(messages, model, search_mode=None, temp=None, maxtok=None):
-    _need_pplx()
+        raise RuntimeError("Perplexity API key missing.")
     h = {"Authorization": f"Bearer {PPLX_KEY}", "Content-Type": "application/json"}
     body = {"model": model, "messages": messages, "stream": False,
             "temperature": CFG.pplx.temperature if temp is None else temp,
             "max_tokens": CFG.pplx.max_tokens if maxtok is None else maxtok}
     if search_mode: body["search_mode"] = search_mode
-    r = S.post(CFG.pplx.url, headers=h, json=body, timeout=CFG.pubmed.timeout)
+    r = S.post(CFG.pplx.url, headers=h, json=body, timeout=CFG.pplx.timeout)
     if r.status_code == 401: raise RuntimeError("Perplexity API key invalid.")
     r.raise_for_status()
     return (r.json().get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+
+def _gemini(system_text: str, user_text: str, temp=None, maxtok=None):
+    if not GEMINI_KEY:
+        raise RuntimeError("Gemini API key missing.")
+    q = {
+        "contents": [
+            {"role": "user", "parts": [{"text": (system_text.strip() + "\n\n" + user_text.strip()).strip()}]}
+        ],
+        "generationConfig": {
+            "temperature": CFG.gemini.temperature if temp is None else temp,
+            "maxOutputTokens": CFG.gemini.max_output_tokens if maxtok is None else maxtok,
+        }
+    }
+    r = S.post(f"{CFG.gemini.url}?key={GEMINI_KEY}", json=q, timeout=CFG.gemini.timeout)
+    if r.status_code == 401: raise RuntimeError("Gemini API key invalid.")
+    r.raise_for_status()
+    data = r.json() or {}
+    # best-effort content extraction
+    try:
+        return (data["candidates"][0]["content"]["parts"][0]["text"] or "").strip()
+    except Exception:
+        return ""
+
+def llm_json(system_text: str, user_text: str, *, model_kind: str, search_mode: Optional[str]=None, temp: Optional[float]=None, maxtok: Optional[int]=None) -> Optional[Dict[str,Any]]:
+    """
+    Uniform JSON call:
+    - First try Perplexity (fast/accurate).
+    - On error or empty/invalid -> try Gemini.
+    - If still invalid -> None (caller uses heuristics).
+    """
+    txt = ""
+    try:
+        txt = _pplx(
+            [{"role":"system","content":system_text},
+             {"role":"user","content":user_text}],
+            {
+                "plan": CFG.pplx.model_plan,
+                "guard": CFG.pplx.model_guard,
+                "intent": CFG.pplx.model_intent,
+                "summary": CFG.pplx.model_summary
+            }[model_kind],
+            search_mode, temp=temp, maxtok=maxtok
+        )
+    except Exception:
+        # PPLX failed; try Gemini
+        try:
+            txt = _gemini(system_text, user_text, temp=temp, maxtok=maxtok)
+        except Exception:
+            return None
+    js = json_from_text(txt)
+    if js is None:
+        # final attempt: if PPLX succeeded but text was chatty, try reparse soft
+        js = json_from_text(txt)
+    return js
 
 def json_from_text(t):
     t = re.sub(r"```(?:json)?\s*|\s*```", "", t or "").strip()
@@ -213,17 +262,7 @@ def guardrail_domain(query: str) -> Dict[str, Any]:
     JSON schema: {"domain_relevant": true, "reason": "short justification"}
     """).strip()
     user = json.dumps({"query": norm(query)}, ensure_ascii=False)
-    try:
-        content = pplx(
-            [{"role":"system","content":sys},
-             {"role":"user","content":user}],
-            CFG.pplx.model_guard,
-            CFG.pplx.search_mode_plan,
-            temp=0.0, maxtok=120
-        )
-        js = json_from_text(content)
-    except Exception:
-        js = None
+    js = llm_json(sys, user, model_kind="guard", search_mode=CFG.pplx.search_mode_plan, temp=0.0, maxtok=120)
     if not js:
         words = [t for t in tok(query) if t.lower() not in STOP]
         return {"domain_relevant": len(words) >= 2, "reason": "Heuristic fallback"}
@@ -237,12 +276,8 @@ def plan_tokens(query):
     If Intervention & Comparator exist → must_pair=true. Include boolean "domain_relevant".
     JSON: {"chunks":[],"anchors":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[],"Population":[],"Context":[]},"mesh_terms":{"Disease":[],"Intervention":[],"Comparator":[],"Outcome":[]},"must_pair":{"require_intervention_vs_comparator":false},"domain_relevant":true}
     """).strip()
-    content = pplx(
-        [{"role":"system","content":sys},
-         {"role":"user","content":json.dumps({"query": norm(query)}, ensure_ascii=False)}],
-        CFG.pplx.model_plan, CFG.pplx.search_mode_plan, temp=0.0, maxtok=500
-    )
-    js = json_from_text(content)
+    user = json.dumps({"query": norm(query)}, ensure_ascii=False)
+    js = llm_json(sys, user, model_kind="plan", search_mode=CFG.pplx.search_mode_plan, temp=0.0, maxtok=500)
     if not js:
         toks = [t for t in tok(query) if t.lower() not in STOP]
         return {"chunks": list(dict.fromkeys(toks[:6])),
@@ -447,21 +482,32 @@ def fuse_mmr(query, docs):
         d.scores = {**(d.scores or {}), "cos": float(cos[i]), "bonus": float(bon[i]), "fused_raw": float(fused[i])}
     return [dtop[i] for i in picks]
 
-# ==================== prompt-engineered intent (NO keyword triggers) ====================
+# ==================== history/context ====================
 @dataclass
 class ResolvedContext:
     follow_up: bool = False
     reason: str = ""
     augmented_query: str = ""
-    brief: str = ""              # compact history synopsis
+    brief: str = ""             # compact history synopsis
     prior_docs: List[Doc] = field(default_factory=list)
-    mode: str = "summary"        # "brief" | "summary" | "detail" | "specific"
-    reuse_prior: bool = False    # prefer prior docs if True
-    relation: str = "new_topic"  # "same_topic" | "deepening" | "summarization" | "contrast" | "new_topic"
+
+def _intent_heuristic(query: str, recent_msgs: List[Dict[str,str]]) -> ResolvedContext:
+    ql = query.lower().strip()
+    referential = any(w in ql.split() for w in ("it","that","those","they","this","these","him","her","them")) \
+                  or ql.startswith(("and ","also ","what about","how about","same","ok","hmm","continue","more","next"))
+    summarize_like = any(k in ql for k in ("summarize","summary","tl;dr","abstract","explain briefly","explain in brief"))
+    follow = referential or summarize_like or len(ql.split()) <= 4
+    prev_topic = ""
+    for m in reversed(recent_msgs):
+        if m.get("role") == "user":
+            prev_topic = norm(m.get("content",""))[:120]
+            break
+    aug = (prev_topic + " — " + query)[:180] if follow and prev_topic else query
+    return ResolvedContext(follow_up=follow, reason="heuristic", augmented_query=aug, brief=prev_topic)
 
 def _minify_messages(messages: List[Dict[str,str]], max_chars: int = 320) -> str:
     bits = []
-    for m in messages[-6:]:  # ~3 turns
+    for m in messages[-6:]:  # ~3 turns (~2 prompts history emphasized)
         r = m.get("role","")[:1].upper()
         c = norm(m.get("content",""))
         if not c: continue
@@ -498,146 +544,44 @@ def _enrich_prior_docs(prior_docs: List[Doc]) -> List[Doc]:
             pass
     return prior_docs
 
-def classify_intent_via_llm(current_query: str, prev_user_1: str, prev_user_2: str, chat_brief: str) -> Optional[Dict[str, Any]]:
-    """
-    Semantic (prompt-driven) discourse-intent classifier. No keyword triggers.
-    """
-    sys = textwrap.dedent("""
-    You are a discourse-intent classifier for a biomedical Q&A system.
-    Infer the user's PURPOSE without relying on literal cue words.
-    Judge from semantic continuity, reference resolution, and conversational objectives
-    (compare, condense, expand, narrow, specify).
-
-    Definitions:
-    - follow_up: True if the current question semantically depends on, refines, or continues the prior topic.
-    - relation:
-        • "same_topic"   — essentially the same ask as before (near-duplicate).
-        • "deepening"    — requests elaboration, mechanisms, endpoints, more specificity.
-        • "summarization"— requests condensation/recap of prior or retrieved evidence.
-        • "contrast"     — requests comparison with another target or changed axis.
-        • "new_topic"    — unrelated to the last turns.
-    - response_mode:
-        • "brief"   — crisp overview with only essentials.
-        • "summary" — balanced synthesis.
-        • "detail"  — thorough, method/estimate-level treatment.
-        • "specific"— targeted answer to a narrow sub-question.
-    - reuse_prior: True if prior evidence should be reused (near-duplicate or tight continuity).
-    - augmented_query: resolve references/pronouns; ≤ 20 words. If not needed, empty.
-
-    Output STRICT JSON:
-    {"follow_up": bool, "relation": "...", "response_mode": "...", "reuse_prior": bool, "augmented_query": "string", "reason": "string"}
-    """).strip()
-
-    payload = {
-        "current_query": norm(current_query),
-        "previous_user_1": norm(prev_user_1 or ""),
-        "previous_user_2": norm(prev_user_2 or ""),
-        "chat_brief": chat_brief or ""
-    }
-    try:
-        content = pplx(
-            [{"role": "system", "content": sys},
-             {"role": "user",   "content": json.dumps(payload, ensure_ascii=False)}],
-            CFG.pplx.model_intent, CFG.pplx.search_mode_intent, temp=0.0, maxtok=220
-        )
-        return json_from_text(content)
-    except Exception:
-        return None
-
-def _intent_fallback(current_query: str, recent_msgs: List[Dict[str, str]]) -> ResolvedContext:
-    # last two user turns (content only)
-    prev_user_1, prev_user_2 = "", ""
-    for m in reversed(recent_msgs):
-        if m.get("role") == "user":
-            if not prev_user_1: prev_user_1 = norm(m.get("content", ""))
-            elif not prev_user_2: prev_user_2 = norm(m.get("content", ""))
-            if prev_user_1 and prev_user_2: break
-
-    # semantic similarity only (no keyword heuristics)
-    sims = []
-    try:
-        if prev_user_1: sims.append(_sim(current_query, prev_user_1))
-        if prev_user_2: sims.append(_sim(current_query, prev_user_2))
-    except Exception:
-        sims = []
-    sim_max = max(sims) if sims else 0.0
-
-    follow = bool(sim_max >= 0.82)
-    reuse = bool(sim_max >= 0.82)
-    relation = "same_topic" if sim_max >= 0.90 else ("deepening" if sim_max >= 0.82 else "new_topic")
-    aug = (prev_user_1 + " — " + current_query)[:180] if follow and prev_user_1 else current_query
-
-    return ResolvedContext(
-        follow_up=follow,
-        reason="embedding-sim",
-        augmented_query=aug,
-        brief=(prev_user_1 or "")[:120],
-        prior_docs=[],
-        mode="summary",           # neutral default; summarizer still respects role
-        reuse_prior=reuse,
-        relation=relation
-    )
-
 def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedContext:
     if not history:
-        return ResolvedContext(
-            follow_up=False, reason="no-history", augmented_query=query,
-            brief="", prior_docs=[], mode="summary", reuse_prior=False, relation="new_topic"
-        )
-
+        return ResolvedContext(follow_up=False, reason="no-history", augmented_query=query, brief="", prior_docs=[])
     msgs = history.get("recent_messages") or []
     prior_docs_in = history.get("prior_docs") or []
 
-    # convert/enrich prior docs
     pd: List[Doc] = []
     for dd in prior_docs_in:
         d = _to_doc(dd)
         if d: pd.append(d)
     pd = _enrich_prior_docs(pd)
 
-    # last two user turns (content only)
-    prev_user_1, prev_user_2 = "", ""
-    for m in reversed(msgs):
-        if m.get("role") == "user":
-            if not prev_user_1: prev_user_1 = norm(m.get("content",""))
-            elif not prev_user_2: prev_user_2 = norm(m.get("content",""))
-            if prev_user_1 and prev_user_2: break
+    brief = _minify_messages(msgs)
 
-    chat_brief = _minify_messages(msgs)
+    # Try intent via LLM (strict JSON). If that fails, heuristic.
+    sys = textwrap.dedent("""
+    You detect whether the latest user question is a FOLLOW-UP to the prior chat or a NEW standalone query.
+    Output STRICT JSON only with keys:
+    {"follow_up": true|false, "augmented_query": "≤15 words that resolves pronouns, else empty", "reason": "≤12 words"}
+    Consider pronouns, ellipsis ("and what about dosage?"), "summarize that", etc.
+    Only for summarization/explanation behavior; do not change retrieval rules.
+    """).strip()
+    user = json.dumps({
+        "current_query": norm(query),
+        "chat_brief": brief
+    }, ensure_ascii=False)
 
-    # prompt-driven classifier, fallback to embedding-only similarity
-    js = classify_intent_via_llm(query, prev_user_1, prev_user_2, chat_brief)
-    if not js:
-        fb = _intent_fallback(query, msgs)
-        fb.prior_docs = pd
-        fb.brief = chat_brief or fb.brief
-        return fb
+    js = llm_json(sys, user, model_kind="intent", search_mode=CFG.pplx.search_mode_intent, temp=0.0, maxtok=140)
+    if js:
+        follow = bool(js.get("follow_up", False))
+        aug = norm(js.get("augmented_query","")) or query
+        reason = js.get("reason","")
+        return ResolvedContext(follow_up=follow, reason=reason, augmented_query=aug, brief=brief, prior_docs=pd)
 
-    follow = bool(js.get("follow_up", False))
-    relation = str(js.get("relation", "new_topic"))
-    mode = str(js.get("response_mode", "summary"))
-    reuse_prior = bool(js.get("reuse_prior", False))
-    aug = norm(js.get("augmented_query","")) or query
-    reason = str(js.get("reason",""))
-
-    # strengthen reuse via embedding similarity (still no trigger words)
-    try:
-        sim1 = _sim(query, prev_user_1) if prev_user_1 else 0.0
-        sim2 = _sim(query, prev_user_2) if prev_user_2 else 0.0
-        if max(sim1, sim2) >= 0.82: reuse_prior = True
-    except Exception:
-        pass
-
-    return ResolvedContext(
-        follow_up=follow,
-        reason=reason or "llm",
-        augmented_query=aug,
-        brief=chat_brief,
-        prior_docs=pd,
-        mode=mode if mode in ("brief","summary","detail","specific") else "summary",
-        reuse_prior=reuse_prior,
-        relation=relation if relation in ("same_topic","deepening","summarization","contrast","new_topic") else "new_topic"
-    )
+    fb = _intent_heuristic(query, msgs)
+    fb.prior_docs = pd
+    fb.brief = brief or fb.brief
+    return fb
 
 # ================= evidence + summary =================
 def evidence_pack(docs, cap=5):
@@ -657,26 +601,19 @@ def _role_flavor(role: Optional[str]) -> str:
         return "Use a technical tone; emphasize design, endpoints, estimates, and limits."
     return "Use clear, precise prose without bullets or markdown."
 
-def _mode_instructions(mode: str) -> Tuple[int, str]:
-    m = (mode or "summary").lower()
-    if m == "brief":
-        return 3, "Keep conclusion concise; at most 3 key_findings and 2 quality_and_limits. "
-    if m == "detail":
-        return 5, "Provide in-depth synthesis; up to 6 key_findings and 4 quality_and_limits with specific effect sizes if available. "
-    if m == "specific":
-        return 4, "Answer the specific sub-question directly; focus on targeted evidence; include 2–4 key_findings. "
-    return 5, "Provide a balanced synthesis; 3–5 key_findings and 2–4 quality_and_limits. "
+def _summarize_llm(system_text: str, user_text: str) -> Optional[Dict[str,Any]]:
+    # First PPLX, then Gemini
+    js = llm_json(system_text + " Return MINIFIED JSON only.", user_text, model_kind="summary", search_mode=CFG.pplx.search_mode_summary, temp=0.0, maxtok=900)
+    return js
 
-def summarize(query, docs, exact_flag=False, role: Optional[str]=None, mode: str="summary"):
+def summarize(query, docs, exact_flag=False, role: Optional[str]=None):
     if not docs:
         return {"question":query,"answer":{"conclusion":"No eligible PubMed items found.","key_findings":[],"quality_and_limits":["Try broadening filters or removing exclusions."],"evidence_citations":[]}, "citation_links":{}}
 
-    doc_cap, mode_note = _mode_instructions(mode)
-    cap = max(1, min(doc_cap, len(docs)))
+    cap = CFG.summary.top_docs_for_pack
     pack, links = evidence_pack(docs, cap=cap)
 
-    flavor = ("Every factual sentence must include bracket citations like [1][2]. Do not use asterisks, dashes, bullets, or markdown anywhere. "
-              + mode_note)
+    flavor = "Every factual sentence must include bracket citations like [1][2]. Do not use asterisks, dashes, bullets, or markdown anywhere. "
     if exact_flag: flavor += "Treat the single paper as an exact match. "
     flavor += _role_flavor(role)
 
@@ -684,18 +621,7 @@ def summarize(query, docs, exact_flag=False, role: Optional[str]=None, mode: str
     schema = {"question":"string","answer":{"conclusion":"string","key_findings":"array","quality_and_limits":"array","evidence_citations":"array","evidence_notes":"object"}}
     user = f"QUESTION\n{query}\n\n{pack}\n\nTASK\nReturn MINIFIED JSON exactly in this schema (no prose):\n{json.dumps(schema,indent=2)}\nIf a field is missing in EVIDENCE PACK, write 'not reported'. Ensure every claim has bracket citations."
 
-    try:
-        content = pplx([{"role":"system","content":sys+" Return MINIFIED JSON only."},
-                        {"role":"user","content":user}],
-                       CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=900)
-        js = json_from_text(content)
-        if not js:
-            content2 = pplx([{"role":"system","content":sys},
-                             {"role":"user","content":user}],
-                            CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=900)
-            js = json_from_text(content2)
-    except Exception:
-        js = None
+    js = _summarize_llm(sys, user)
 
     if js:
         ans = js.get("answer") or {}
@@ -717,12 +643,12 @@ def summarize(query, docs, exact_flag=False, role: Optional[str]=None, mode: str
             "note":"Fallback summary used."}
 
 def summarize_with_context(query: str, docs: List[Doc], exact_flag: bool, role: Optional[str],
-                           history_brief: str = "", prior_docs: Optional[List[Doc]] = None, mode: str="summary"):
+                           history_brief: str = "", prior_docs: Optional[List[Doc]] = None):
     prior_docs = prior_docs or []
     if not prior_docs:
-        return summarize(query, docs, exact_flag=exact_flag, role=role, mode=mode)
+        return summarize(query, docs, exact_flag=exact_flag, role=role)
 
-    # Build small prior pack (A-indexed)
+    # Build prior pack A1.. and main pack 1..
     pcap = CFG.summary.prior_docs_for_pack
     chosen = prior_docs[:pcap]
     lines = []
@@ -735,17 +661,13 @@ def summarize_with_context(query: str, docs: List[Doc], exact_flag: bool, role: 
         lines.append(f"{head}\n{body}")
     prior_pack = ("PRIOR CONTEXT PACK\n" + "\n\n".join(lines)) if lines else ""
 
-    # Main pack
-    doc_cap, mode_note = _mode_instructions(mode)
-    cap = max(1, min(doc_cap, len(docs)))
+    cap = CFG.summary.top_docs_for_pack
     main_pack, main_links = evidence_pack(docs, cap=cap)
 
-    # Compose prompt
     flavor = _role_flavor(role)
     sys = ("You answer biomedical questions grounded to the provided packs only. "
-           "Prefer the current EVIDENCE PACK; use PRIOR CONTEXT PACK to maintain continuity (compare/clarify/summarize across turns). "
-           "Respond with JSON only; every factual sentence must include bracket citations like [1][2] or [A1]. "
-           + mode_note + flavor)
+           "Prefer the current EVIDENCE PACK; use PRIOR CONTEXT PACK only to maintain continuity (e.g., compare, clarify, or summarize across turns). "
+           "Respond with JSON only; every factual sentence must include bracket citations like [1][2] or [A1]. " + flavor)
 
     schema = {"question":"string","answer":{"conclusion":"string","key_findings":"array","quality_and_limits":"array","evidence_citations":"array","evidence_notes":"object"}}
 
@@ -766,22 +688,13 @@ Cite from [1..{min(cap,len(docs))}] for current evidence; if you must reference 
 If a field is missing, write 'not reported'. Ensure every claim has bracket citations.
 """
 
-    try:
-        content = pplx(
-            [{"role":"system","content":sys+" Return MINIFIED JSON only."},
-             {"role":"user","content":user}],
-            CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=900
-        )
-        js = json_from_text(content)
-    except Exception:
-        js = None
+    js = _summarize_llm(sys, user)
 
     if js:
         ans = js.get("answer") or {}
-        # keep numeric citations (current pack) for FE links
-        norm_cites: List[Any] = ans.get("evidence_citations") or []
+        # Normalize numeric citations for FE; prior A* are allowed for text but we keep numeric for links
         numeric_only = []
-        for x in norm_cites:
+        for x in (ans.get("evidence_citations") or []):
             m = re.search(r"\d+", str(x))
             if m:
                 idx = int(m.group(0))
@@ -791,11 +704,10 @@ If a field is missing, write 'not reported'. Ensure every claim has bracket cita
         ans["key_findings"] = [str(x) for x in (ans.get("key_findings") or [])]
         ans["quality_and_limits"] = [str(x) for x in (ans.get("quality_and_limits") or [])]
         js["answer"] = ans
-        js["citation_links"] = (main_links | links)
+        js["citation_links"] = main_links | links
         return js
 
-    # Fallback: regular summarize
-    return summarize(query, docs, exact_flag=exact_flag, role=role, mode=mode)
+    return summarize(query, docs, exact_flag=exact_flag, role=role)
 
 # ================= helpers =================
 def time_tags(q):
@@ -888,10 +800,10 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
     if not guard.get("domain_relevant", False):
         return _guardrail_payload([], lo, hi, ex, [], guard.get("reason",""))
 
-    # Check direct PMID(s) ask (exact summarize)
+    # Direct PMID?
     direct_pmids = _extract_pmids_from_query(q)
 
-    # Resolve history intent (prompt-driven; no keyword triggers)
+    # Resolve context (follow-up only influences summary/explanation)
     ctx = resolve_context(q, history)
     q_eff = ctx.augmented_query if ctx.follow_up else q
 
@@ -942,7 +854,7 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
         except Exception:
             pass
 
-    # Merge prior docs if follow-up / reuse
+    # Merge prior docs if follow-up
     if ctx.follow_up and ctx.prior_docs:
         for d in ctx.prior_docs:
             if d.pmid not in merged:
@@ -951,13 +863,6 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
     all_docs = list(merged.values())
     final_docs = fuse_mmr(q_eff, all_docs) if all_docs else []
     used_docs = final_docs if final_docs else all_docs
-
-    if ctx.follow_up and ctx.reuse_prior and ctx.prior_docs:
-        merged_for_reuse = {d.pmid: d for d in ctx.prior_docs}
-        for d in used_docs:
-            if d.pmid not in merged_for_reuse:
-                merged_for_reuse[d.pmid] = d
-        used_docs = fuse_mmr(q_eff, list(merged_for_reuse.values()))
 
     t_retrieve_end = time.perf_counter()
 
@@ -968,10 +873,10 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
 
     t_sum_start = time.perf_counter()
     if ctx.follow_up and ctx.prior_docs:
-        summary_obj = summarize_with_context(q, used_docs, exact_flag=(len(used_docs)==1 and not direct_pmids),
-                                             role=role, history_brief=ctx.brief, prior_docs=ctx.prior_docs, mode=ctx.mode)
+        summary_obj = summarize_with_context(q, used_docs, exact_flag=(len(used_docs)==1 and not direct_pmids), role=role,
+                                             history_brief=ctx.brief, prior_docs=ctx.prior_docs)
     else:
-        summary_obj = summarize(q, used_docs, exact_flag=(len(used_docs)==1 and not direct_pmids), role=role, mode=ctx.mode)
+        summary_obj = summarize(q, used_docs, exact_flag=(len(used_docs)==1 and not direct_pmids), role=role)
     t_sum_end = time.perf_counter()
 
     return {
@@ -981,15 +886,14 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
         "time_tags": [lo, hi],
         "exclusions": ex,
         "booleans": tried_booleans,
-        "intent": {"follow_up": ctx.follow_up, "reason": ctx.reason, "augmented_query": ctx.augmented_query,
-                   "chat_brief": ctx.brief, "mode": ctx.mode, "reuse_prior": ctx.reuse_prior, "relation": ctx.relation},
+        "intent": {"follow_up": ctx.follow_up, "reason": ctx.reason, "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief},
         "timings": {
             "retrieve_ms": int((t_retrieve_end - t0)*1000),
             "summarize_ms": int((t_sum_end - t_sum_start)*1000),
         },
     }
 
-# ================= FE compatibility shim =================
+# ================= FE compatibility shim (unchanged API) =================
 def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = False, history: Optional[Dict[str,Any]] = None) -> Tuple[str, Dict[str, Any]]:
     pipe = run_pipeline(question, role=role, history=history)
     summary = pipe.get("summary") or {}; docs = pipe.get("docs") or []
