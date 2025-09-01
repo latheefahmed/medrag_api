@@ -26,14 +26,20 @@ except Exception:
 class PPLXCfg:
     url: str = "https://api.perplexity.ai/chat/completions"
     model_plan: str = os.getenv("PPLX_MODEL_PLAN", "sonar-pro")
-    model_summary: str = os.getenv("PPLX_MODEL_SUMMARY", "sonar-pro")
+    model_answer: str = os.getenv("PPLX_MODEL_ANSWER", "sonar-pro")
     model_guard: str = os.getenv("PPLX_MODEL_GUARD", "sonar-pro")
     model_intent: str = os.getenv("PPLX_MODEL_INTENT", "sonar-mini")  # small, cheap
     temperature: float = float(os.getenv("PPLX_TEMPERATURE", "0.15"))
     max_tokens: int = int(os.getenv("PPLX_MAX_TOKENS", "900"))
     search_mode_plan: Optional[str] = "academic"
-    search_mode_summary: Optional[str] = None
+    search_mode_answer: Optional[str] = None
     search_mode_intent: Optional[str] = None
+
+@dataclass
+class GeminiCfg:
+    url: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    temperature: float = float(os.getenv("GEMINI_TEMPERATURE", "0.0"))
+    max_output_tokens: int = int(os.getenv("GEMINI_MAX_TOKENS", "900"))
 
 @dataclass
 class PubMedCfg:
@@ -63,10 +69,10 @@ class RetrievalCfg:
     min_final: int = 5
 
 @dataclass
-class SummaryCfg:
+class AnswerCfg:
     top_docs_for_pack: int = 5
     abstract_chars: int = 650
-    prior_docs_for_pack: int = 3   # carry a few prior docs
+    prior_docs_for_pack: int = 3   # carry a few prior docs for follow-up summarization
 
 @dataclass
 class BooleanCfg:
@@ -77,10 +83,11 @@ class BooleanCfg:
 @dataclass
 class Cfg:
     pplx: PPLXCfg = field(default_factory=PPLXCfg)
+    gemini: GeminiCfg = field(default_factory=GeminiCfg)
     pubmed: PubMedCfg = field(default_factory=PubMedCfg)
     rank: RankCfg = field(default_factory=RankCfg)
     retrieval: RetrievalCfg = field(default_factory=RetrievalCfg)
-    summary: SummaryCfg = field(default_factory=SummaryCfg)
+    answer: AnswerCfg = field(default_factory=AnswerCfg)
     boolean: BooleanCfg = field(default_factory=BooleanCfg)
     humans_filter: bool = True
 
@@ -88,6 +95,7 @@ CFG = Cfg()
 
 # env keys
 PPLX_KEY = os.getenv("PERPLEXITY_API_KEY", "").strip()
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 PUBMED_KEY = os.getenv("PUBMED_API_KEY", "").strip()
 
 # ================= http =================
@@ -126,6 +134,18 @@ def minmax(a: np.ndarray) -> np.ndarray:
     mn, mx = float(a.min()), float(a.max())
     return np.ones_like(a) * 0.5 if mx - mn < 1e-12 else (a - mn) / (mx - mn)
 
+def json_from_text(t):
+    t = re.sub(r"```(?:json)?\s*|\s*```", "", t or "").strip()
+    o = [m.start() for m in re.finditer(r"\{", t)]
+    c = [m.start() for m in re.finditer(r"\}", t)]
+    if not o or not c: return None
+    chunk = t[o[0]:c[-1]+1]
+    try:
+        return json.loads(re.sub(r",\s*([}\]])", r"\1", chunk))
+    except Exception:
+        try: return json.loads(chunk)
+        except Exception: return None
+
 # --- citation coercion helper (fix for invalid literal for int) ---
 def _coerce_citations(raw, max_idx: int) -> List[int]:
     out: List[int] = []
@@ -134,8 +154,7 @@ def _coerce_citations(raw, max_idx: int) -> List[int]:
             idx = int(x)
         elif isinstance(x, str):
             m = re.search(r"\d+", x)
-            if not m:
-                continue
+            if not m: continue
             idx = int(m.group(0))
         else:
             continue
@@ -161,12 +180,12 @@ def embed(texts: List[str]) -> np.ndarray:
     if not texts: return np.zeros((0, 768), dtype=np.float32)
     return _EMB.encode(texts, CFG.rank.embed_batch)
 
-# ================= Perplexity =================
+# ================= Perplexity + Gemini wrappers =================
 def _need_pplx():
     if not PPLX_KEY:
         raise RuntimeError("Perplexity API key missing or invalid (set PERPLEXITY_API_KEY).")
 
-def pplx(messages, model, search_mode=None, temp=None, maxtok=None):
+def pplx(messages, model, search_mode=None, temp=None, maxtok=None) -> str:
     _need_pplx()
     h = {"Authorization": f"Bearer {PPLX_KEY}", "Content-Type": "application/json"}
     body = {"model": model, "messages": messages, "stream": False,
@@ -178,17 +197,55 @@ def pplx(messages, model, search_mode=None, temp=None, maxtok=None):
     r.raise_for_status()
     return (r.json().get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
 
-def json_from_text(t):
-    t = re.sub(r"```(?:json)?\s*|\s*```", "", t or "").strip()
-    o = [m.start() for m in re.finditer(r"\{", t)]
-    c = [m.start() for m in re.finditer(r"\}", t)]
-    if not o or not c: return None
-    chunk = t[o[0]:c[-1]+1]
+def gemini_from_prompts(system_text: str, user_text: str, maxtok: Optional[int]=None, temp: Optional[float]=None) -> str:
+    if not GEMINI_KEY:
+        raise RuntimeError("Gemini API key missing or invalid (set GEMINI_API_KEY).")
+    url = f"{CFG.gemini.url}?key={GEMINI_KEY}"
+    payload = {
+        "contents": [
+            {"role": "user", "parts": [{"text": f"[SYSTEM]\n{system_text}\n\n[USER]\n{user_text}"}]}
+        ],
+        "generationConfig": {
+            "temperature": CFG.gemini.temperature if temp is None else float(temp),
+            "maxOutputTokens": CFG.gemini.max_output_tokens if maxtok is None else int(maxtok),
+        }
+    }
+    r = S.post(url, json=payload, timeout=CFG.pubmed.timeout)
+    r.raise_for_status()
+    j = r.json()
+    txt = ""
     try:
-        return json.loads(re.sub(r",\s*([}\]])", r"\1", chunk))
+        txt = j["candidates"][0]["content"]["parts"][0]["text"]
     except Exception:
-        try: return json.loads(chunk)
-        except Exception: return None
+        # fallback to any text field we can find
+        txt = (j.get("candidates",[{}])[0].get("content",{}).get("parts",[{"text":""}])[0].get("text","")) or ""
+    return txt
+
+def llm_json(system_text: str, user_text: str, *, maxtok: int=900, temp: float=0.0) -> Optional[Dict[str,Any]]:
+    """
+    Try Perplexity first; if it fails or yields invalid JSON, fall back to Gemini.
+    """
+    # Try Perplexity
+    try:
+        content = pplx(
+            [{"role":"system","content":system_text},
+             {"role":"user","content":user_text}],
+            CFG.pplx.model_answer, CFG.pplx.search_mode_answer, temp=temp, maxtok=maxtok
+        )
+        js = json_from_text(content)
+        if js: return js
+    except Exception:
+        pass
+
+    # Fall back to Gemini
+    try:
+        gtxt = gemini_from_prompts(system_text, user_text, maxtok=maxtok, temp=temp)
+        js2 = json_from_text(gtxt)
+        if js2: return js2
+    except Exception:
+        pass
+
+    return None
 
 # ================= guardrails =================
 def guardrail_domain(query: str) -> Dict[str, Any]:
@@ -216,7 +273,7 @@ def guardrail_domain(query: str) -> Dict[str, Any]:
         return {"domain_relevant": len(words) >= 2, "reason": "Heuristic fallback"}
     return {"domain_relevant": bool(js.get("domain_relevant", False)), "reason": str(js.get("reason",""))}
 
-# ================= planner =================
+# ================= planner (token-minimal composer) =================
 def plan_tokens(query):
     sys = textwrap.dedent("""
     You are a biomedical retrieval planner. Output STRICT JSON only.
@@ -445,19 +502,20 @@ class ResolvedContext:
 
 def _intent_fallback(query: str, recent_msgs: List[Dict[str,str]]) -> ResolvedContext:
     ql = query.lower().strip()
+    # heuristic: short or referential or summary-ish
     referential = any(w in ql.split() for w in ("it","that","those","they","this","these","him","her","them")) \
                   or ql.startswith(("and ","also ","what about","how about","same","ok","hmm","continue","more","next"))
-    summarize_like = any(k in ql for k in ("summarize","summary","tl;dr","abstract"))
+    summarize_like = any(k in ql for k in ("summarize","summary","tl;dr","abstract","in brief","briefly"))
     follow = referential or summarize_like or len(ql.split()) <= 4
     prev_topic = ""
     for m in reversed(recent_msgs):
         if m.get("role") == "user":
-            prev_topic = norm(m.get("content",""))[:120]
+            prev_topic = norm(m.get("content",""))[:160]
             break
-    aug = (prev_topic + " — " + query)[:180] if follow and prev_topic else query
+    aug = (prev_topic + " — " + query)[:200] if follow and prev_topic else query
     return ResolvedContext(follow_up=follow, reason="heuristic", augmented_query=aug, brief=prev_topic)
 
-def _minify_messages(messages: List[Dict[str,str]], max_chars: int = 320) -> str:
+def _minify_messages(messages: List[Dict[str,str]], max_chars: int = 360) -> str:
     bits = []
     for m in messages[-6:]:  # ~3 turns
         r = m.get("role","")[:1].upper()
@@ -484,6 +542,7 @@ def _to_doc(d: Dict[str,Any]) -> Optional[Doc]:
     )
 
 def _enrich_prior_docs(prior_docs: List[Doc]) -> List[Doc]:
+    # Fetch missing abstracts/types if needed (bounded)
     missing = [d.pmid for d in prior_docs if not d.abstract][:8]
     if missing:
         try:
@@ -502,6 +561,7 @@ def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedCon
     msgs = history.get("recent_messages") or []
     prior_docs_in = history.get("prior_docs") or []
 
+    # convert docs
     pd: List[Doc] = []
     for dd in prior_docs_in:
         d = _to_doc(dd)
@@ -510,6 +570,7 @@ def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedCon
 
     brief = _minify_messages(msgs)
 
+    # Try intent model (cheap), fallback to heuristic
     try:
         sys = textwrap.dedent("""
         You detect whether the latest user question is a FOLLOW-UP to the prior chat or a NEW standalone query.
@@ -537,51 +598,79 @@ def resolve_context(query: str, history: Optional[Dict[str,Any]]) -> ResolvedCon
         fb.brief = brief or fb.brief
         return fb
 
-# ================= evidence + summary =================
+# ================= evidence + answer generation =================
 def evidence_pack(docs, cap=5):
     chosen = docs[:cap]; idx2url = {}; lines = []
     for i, d in enumerate(chosen, 1):
         idx2url[i] = pmid_url(d.pmid)
         head = f"[{i}] PMID {d.pmid} ({d.year}) {d.journal} — {d.title} ({idx2url[i]})".strip(" —")
-        body = f"Abstract: {d.abstract[:CFG.summary.abstract_chars]}" if d.abstract else "Abstract: (not available)"
+        body = f"Abstract: {d.abstract[:CFG.answer.abstract_chars]}" if d.abstract else "Abstract: (not available)"
         lines.append(f"{head}\n{body}")
     return "EVIDENCE PACK\n" + "\n\n".join(lines), idx2url
 
 def _role_flavor(role: Optional[str]) -> str:
     r = (role or "").lower()
+    if r in ("patient", "layperson", "caregiver"):
+        return ("Write in plain language, avoid jargon, give balanced context, and include practical clarity. "
+                "This is not medical advice.")
     if r in ("doctor","clinician","physician","md"):
         return "Write clinically and concisely with effect sizes and guideline context; avoid advice."
     if r in ("researcher","scientist"):
-        return "Use a technical tone; emphasize design, endpoints, estimates, and limits."
-    return "Use clear, precise prose without bullets or markdown."
+        return "Use a technical tone; emphasize design, endpoints, estimates, and limitations."
+    return "Use clear, precise prose."
 
-def summarize(query, docs, exact_flag=False, role: Optional[str]=None):
+def detect_mode(query: str) -> str:
+    ql = query.lower()
+    if any(k in ql for k in ("summarize", "tl;dr", "in brief", "briefly", "short version")):
+        return "brief"
+    if any(k in ql for k in ("explain in detail", "detailed", "deep dive", "elaborate", "expand", "comprehensive")):
+        return "detail"
+    # default to detailed for first-time asks
+    return "detail"
+
+def generate_answer(*, original_query: str, docs: List[Doc], mode: str, role: Optional[str], history_brief: str="") -> Dict[str,Any]:
+    """
+    Single generator that produces the structured answer JSON.
+    No separate summarizer functions; mode controls brevity.
+    """
     if not docs:
-        return {"question":query,"answer":{"conclusion":"No eligible PubMed items found.","key_findings":[],"quality_and_limits":["Try broadening filters or removing exclusions."],"evidence_citations":[]}, "citation_links":{}}
+        return {"question": original_query,
+                "answer": {"conclusion":"No eligible PubMed items found.",
+                           "key_findings":[],
+                           "quality_and_limits":["Try broadening filters or removing exclusions."],
+                           "evidence_citations":[]},
+                "citation_links": {}}
 
-    cap = CFG.summary.top_docs_for_pack
+    cap = CFG.answer.top_docs_for_pack
     pack, links = evidence_pack(docs, cap=cap)
 
-    flavor = "Every factual sentence must include bracket citations like [1][2]. Do not use asterisks, dashes, bullets, or markdown anywhere. "
-    if exact_flag: flavor += "Treat the single paper as an exact match. "
-    flavor += _role_flavor(role)
+    style = _role_flavor(role)
+    brevity = "Be as concise as possible." if mode == "brief" else "Provide a thorough, structured explanation."
+    schema = {"question":"string","answer":{"conclusion":"string",
+                                            "key_findings":"array",
+                                            "quality_and_limits":"array",
+                                            "evidence_citations":"array"}}
 
-    sys = ("Use ONLY the EVIDENCE PACK; do not browse. Prefer RCTs/meta-analyses/guidelines. Respond with JSON only. " + flavor)
-    schema = {"question":"string","answer":{"conclusion":"string","key_findings":"array","quality_and_limits":"array","evidence_citations":"array","evidence_notes":"object"}}
-    user = f"QUESTION\n{query}\n\n{pack}\n\nTASK\nReturn MINIFIED JSON exactly in this schema (no prose):\n{json.dumps(schema,indent=2)}\nIf a field is missing in EVIDENCE PACK, write 'not reported'. Ensure every claim has bracket citations."
+    sys = ("You answer biomedical questions using ONLY the EVIDENCE PACK (no external browsing). "
+           "Every factual sentence must include bracket citations like [1][2]; only cite items present in the pack. "
+           "Return STRICT MINIFIED JSON only, exactly matching the provided schema. "
+           f"{style} {brevity}")
 
-    try:
-        content = pplx([{"role":"system","content":sys+" Return MINIFIED JSON only."},
-                        {"role":"user","content":user}],
-                       CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=900)
-        js = json_from_text(content)
-        if not js:
-            content2 = pplx([{"role":"system","content":sys},
-                             {"role":"user","content":user}],
-                            CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=900)
-            js = json_from_text(content2)
-    except Exception:
-        js = None
+    user = f"""CHAT BRIEF
+{history_brief or "(none)"}
+
+QUESTION
+{original_query}
+
+{pack}
+
+TASK
+Return MINIFIED JSON exactly in this schema (no prose outside JSON):
+{json.dumps(schema, indent=2)}
+If a field is missing, write 'not reported'. Ensure every factual sentence has bracket citations.
+"""
+
+    js = llm_json(sys, user, maxtok=CFG.pplx.max_tokens, temp=0.0)
 
     if js:
         ans = js.get("answer") or {}
@@ -591,97 +680,19 @@ def summarize(query, docs, exact_flag=False, role: Optional[str]=None):
         ans["quality_and_limits"] = [str(x) for x in (ans.get("quality_and_limits") or [])]
         js["answer"] = ans
         js["citation_links"] = links
+        js["mode"] = mode
         return js
 
+    # Minimal fallback if both models fail JSON
     cites = list(range(1, min(cap, len(docs)) + 1))
-    return {"question":query,
-            "answer":{"conclusion":"See synthesized findings from the evidence pack [1].",
-                      "key_findings":[f"See items {cites} for key outcomes."],
-                      "quality_and_limits":["Automatic fallback summary; verify primary sources."],
-                      "evidence_citations": cites},
+    return {"question": original_query,
+            "answer": {"conclusion": "See synthesized findings from the evidence pack [1].",
+                       "key_findings": [f"See items {cites} for key outcomes."],
+                       "quality_and_limits": ["Automatic fallback; verify primary sources."],
+                       "evidence_citations": cites},
             "citation_links": links,
-            "note":"Fallback summary used."}
-
-# ---- context-aware summary ----
-def summarize_with_context(query: str, docs: List[Doc], exact_flag: bool, role: Optional[str],
-                           history_brief: str = "", prior_docs: Optional[List[Doc]] = None):
-    prior_docs = prior_docs or []
-    if not prior_docs:
-        return summarize(query, docs, exact_flag=exact_flag, role=role)
-
-    # Build small prior pack (A-indexed)
-    pcap = CFG.summary.prior_docs_for_pack
-    chosen = prior_docs[:pcap]
-    lines = []
-    links: Dict[str,str] = {}
-    for i, d in enumerate(chosen, 1):
-        tag = f"A{i}"
-        links[tag] = pmid_url(d.pmid)
-        head = f"[{tag}] PMID {d.pmid} ({d.year}) {d.journal} — {d.title} ({links[tag]})"
-        body = f"Abstract: {d.abstract[:CFG.summary.abstract_chars]}" if d.abstract else "Abstract: (not available)"
-        lines.append(f"{head}\n{body}")
-    prior_pack = ("PRIOR CONTEXT PACK\n" + "\n\n".join(lines)) if lines else ""
-
-    # Main pack
-    cap = CFG.summary.top_docs_for_pack
-    main_pack, main_links = evidence_pack(docs, cap=cap)
-
-    # Compose prompt
-    flavor = _role_flavor(role)
-    sys = ("You answer biomedical questions grounded to the provided packs only. "
-           "Prefer the current EVIDENCE PACK; use PRIOR CONTEXT PACK only to maintain continuity (e.g., compare, clarify, or summarize across turns). "
-           "Respond with JSON only; every factual sentence must include bracket citations like [1][2] or [A1]. "
-           + flavor)
-
-    schema = {"question":"string","answer":{"conclusion":"string","key_findings":"array","quality_and_limits":"array","evidence_citations":"array","evidence_notes":"object"}}
-
-    user = f"""CHAT BRIEF
-{history_brief or "(none)"}
-
-QUESTION
-{query}
-
-{main_pack}
-
-{prior_pack if prior_pack else ""}
-
-TASK
-Return MINIFIED JSON exactly in this schema (no prose):
-{json.dumps(schema,indent=2)}
-Cite from [1..{min(cap,len(docs))}] for current evidence; if you must reference prior context, use [A1..A{len(chosen)}].
-If a field is missing, write 'not reported'. Ensure every claim has bracket citations.
-"""
-
-    try:
-        content = pplx(
-            [{"role":"system","content":sys+" Return MINIFIED JSON only."},
-             {"role":"user","content":user}],
-            CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=900
-        )
-        js = json_from_text(content)
-    except Exception:
-        js = None
-
-    if js:
-        ans = js.get("answer") or {}
-        # Normalize citations: allow both numeric and 'A*'
-        norm_cites: List[Any] = ans.get("evidence_citations") or []
-        numeric_only = []
-        for x in norm_cites:
-            m = re.search(r"\d+", str(x))
-            if m:
-                idx = int(m.group(0))
-                if 1 <= idx <= min(cap, len(docs)) and idx not in numeric_only:
-                    numeric_only.append(idx)
-        ans["evidence_citations"] = numeric_only
-        ans["key_findings"] = [str(x) for x in (ans.get("key_findings") or [])]
-        ans["quality_and_limits"] = [str(x) for x in (ans.get("quality_and_limits") or [])]
-        js["answer"] = ans
-        js["citation_links"] = main_links | links
-        return js
-
-    # Fallback: regular summarize
-    return summarize(query, docs, exact_flag=exact_flag, role=role)
+            "mode": mode,
+            "note": "Model JSON fallback used."}
 
 # ================= helpers =================
 def time_tags(q):
@@ -718,7 +729,6 @@ def widen_variants(plan, q, lo, hi, ex):
     chans.append({"label":"ultra_relaxed","query": ultra_relaxed(q, lo, hi, [])})
     return chans
 
-# ================= pipeline =================
 def _guardrail_payload(chunks, lo, hi, ex, tried, reason: str = ""):
     base = "We can’t search relevant keywords from our PubMed-backed database. Please try another query using healthcare or biomedical terminology."
     msg = base if not reason else f"{base} {reason}".strip()
@@ -747,9 +757,7 @@ def _fetch_docs_by_pmids(pmids: List[str]) -> List[Doc]:
     meta = {}
     for pid in pmids:
         e = sm.get(pid, {})
-        ttl = (e.get("title") or "").strip()
-        if not ttl:
-            ttl = ""
+        ttl = (e.get("title") or "").strip() or ""
         jr = (e.get("fulljournalname") or e.get("source") or "").strip()
         pd = e.get("pubdate", "")
         m = re.search(r"\b(19|20)\d{2}\b", pd)
@@ -767,19 +775,21 @@ def _fetch_docs_by_pmids(pmids: List[str]) -> List[Doc]:
         ))
     return out
 
+# ================= main synchronous pipeline =================
 def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,Any]] = None):
     t0 = time.perf_counter()
     q = norm(query); lo, hi = time_tags(q); ex = parse_not(q)
 
-    # Guardrail (kept here for completeness; in /ask we bypass for follow-ups with context)
+    # Resolve history intent BEFORE guardrail (so "summarize the above" can bypass)
+    ctx = resolve_context(q, history)
+    mode = detect_mode(q)
+
+    # Guardrail (allow follow-up summarize/detail even if domain_relevant is false)
     guard = guardrail_domain(q)
-    if not guard.get("domain_relevant", False):
+    if not guard.get("domain_relevant", False) and not ctx.follow_up:
         return _guardrail_payload([], lo, hi, ex, [], guard.get("reason",""))
 
     direct_pmids = _extract_pmids_from_query(q)
-
-    # Resolve history intent
-    ctx = resolve_context(q, history)
     q_eff = ctx.augmented_query if ctx.follow_up else q
 
     # Planner
@@ -788,17 +798,19 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
     except Exception:
         plan = {"chunks":[t for t in tok(q_eff) if t.lower() not in STOP][:4],"anchors":{},"domain_relevant":True}
 
-    if not plan.get("domain_relevant", True):
+    if not plan.get("domain_relevant", True) and not ctx.follow_up:
         return _guardrail_payload(plan.get("chunks",[]), lo, hi, ex, [], "The query did not appear biomedical.")
 
     q_tokens = len(tok(q_eff))
     variants = compose(plan, lo, hi, ex, qlen=q_tokens)
     tried_booleans, merged = [], {}
 
+    # If explicit PMID(s), short-circuit retrieval
     if direct_pmids:
         for d in _fetch_docs_by_pmids(direct_pmids):
             merged[d.pmid] = d
 
+    # Retrieval
     for v in variants:
         if len(merged) >= CFG.retrieval.topk_titles:
             break
@@ -809,6 +821,7 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
         except Exception:
             continue
 
+    # Widen if needed
     if len(merged) < CFG.retrieval.min_final:
         for lv in widen_variants(plan, q_eff, lo, hi, ex):
             if len(merged) >= CFG.retrieval.min_final: break
@@ -828,6 +841,7 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
         except Exception:
             pass
 
+    # Merge prior docs if follow-up (so summarization can use them)
     if ctx.follow_up and ctx.prior_docs:
         for d in ctx.prior_docs:
             if d.pmid not in merged:
@@ -844,29 +858,37 @@ def run_pipeline(query, role: Optional[str] = None, history: Optional[Dict[str,A
         out["timings"] = {"retrieve_ms": int((t_retrieve_end - t0)*1000), "summarize_ms": 0}
         return out
 
-    t_sum_start = time.perf_counter()
-    if ctx.follow_up and ctx.prior_docs:
-        summary_obj = summarize_with_context(q, used_docs, exact_flag=(len(used_docs)==1 and not direct_pmids), role=role,
-                                             history_brief=ctx.brief, prior_docs=ctx.prior_docs)
-    else:
-        summary_obj = summarize(q, used_docs, exact_flag=(len(used_docs)==1 and not direct_pmids), role=role)
-    t_sum_end = time.perf_counter()
+    # If user asked to "summarize the above"/brief and we have prior docs, prefer those
+    evidence_docs = used_docs
+    if ctx.follow_up and ctx.prior_docs and mode == "brief":
+        evidence_docs = ctx.prior_docs
+
+    # Generate answer immediately (Perplexity primary → Gemini fallback inside llm_json)
+    t_ans_start = time.perf_counter()
+    summary_obj = generate_answer(
+        original_query=q,
+        docs=evidence_docs,
+        mode=mode,
+        role=role,
+        history_brief=ctx.brief
+    )
+    t_ans_end = time.perf_counter()
 
     return {
-        "docs": [{**asdict(d), "url": pmid_url(d.pmid)} for d in used_docs],
+        "docs": [{**asdict(d), "url": pmid_url(d.pmid)} for d in evidence_docs],
         "summary": summary_obj,
         "plan": {"chunks": plan.get("chunks", [])},
         "time_tags": [lo, hi],
         "exclusions": ex,
         "booleans": tried_booleans,
-        "intent": {"follow_up": ctx.follow_up, "reason": ctx.reason, "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief},
+        "intent": {"follow_up": ctx.follow_up, "reason": ctx.reason, "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief, "mode": mode},
         "timings": {
             "retrieve_ms": int((t_retrieve_end - t0)*1000),
-            "summarize_ms": int((t_sum_end - t_sum_start)*1000),
+            "summarize_ms": int((t_ans_end - t_ans_start)*1000),
         },
     }
 
-# ================= FE compatibility shim =================
+# ================= FE compatibility shim (unchanged API; internals updated) =================
 def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = False, history: Optional[Dict[str,Any]] = None) -> Tuple[str, Dict[str, Any]]:
     pipe = run_pipeline(question, role=role, history=history)
     summary = pipe.get("summary") or {}; docs = pipe.get("docs") or []

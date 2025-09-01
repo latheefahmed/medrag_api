@@ -1,7 +1,7 @@
 # app/routers/ask.py
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 from uuid import uuid4
@@ -32,15 +32,6 @@ class AskBody(BaseModel):
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
-def _iso_to_ms(s: Optional[str]) -> int:
-    if not s:
-        return _now_ms()
-    try:
-        s = s.replace("Z", "+00:00") if "Z" in s else s
-        return int(datetime.fromisoformat(s).timestamp() * 1000)
-    except Exception:
-        return _now_ms()
 
 def _mk_references_from_rightpane(rp: Dict[str, Any] | None) -> List[Dict[str, Any]]:
     if not rp:
@@ -154,46 +145,8 @@ def _collect_history_payload(sess_doc: Dict[str,Any]) -> Dict[str,Any]:
         "prior_docs": prior_docs[:8],
     }
 
-def _store_session_meta_after_answer(session_id: str, user_id: str, doc, docs_payload: List[Dict[str,Any]], intent_payload: Dict[str,Any]):
-    """
-    Keep short-term memory in session.meta without breaking schema.
-    - meta.last_docset : list of up to 5 docs (pmid,title,year,journal,abstract,url)
-    - meta.last_refs   : {"1": pmid, ...} based on current order
-    - meta.turn_ring   : capped list (<=3) of previous docsets
-    """
-    curr = doc or {}
-    meta = dict(curr.get("meta") or {})
-
-    # build last_docset (cap 5) and last_refs
-    last_docset = [{
-        "pmid": d.get("pmid"),
-        "title": d.get("title"),
-        "journal": d.get("journal"),
-        "year": d.get("year"),
-        "abstract": d.get("abstract"),
-        "url": d.get("url"),
-    } for d in docs_payload[:5]]
-    last_refs = {str(i+1): d.get("pmid") for i, d in enumerate(docs_payload[:5]) if d.get("pmid")}
-
-    # ring buffer
-    ring: List[List[Dict[str,Any]]] = list(meta.get("turn_ring") or [])
-    if last_docset:
-        ring.append(last_docset)
-    # cap at 3 turns
-    if len(ring) > 3:
-        ring = ring[-3:]
-
-    meta.update({
-        "last_docset": last_docset,
-        "last_refs": last_refs,
-        "turn_ring": ring,
-        "last_intent": intent_payload or {},
-    })
-
-    update_session(session_id, user_id, {"meta": meta})
-
 @router.post("")
-async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
+async def ask(body: AskBody, user=Depends(get_current_user)):
     # ---------- auth ----------
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -222,206 +175,75 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     # Build history BEFORE appending current user message
     history_payload = _collect_history_payload(sess)
 
-    # intent resolution (move BEFORE guardrail so follow-ups can bypass)
-    q_raw = rag.norm(question)
-    ctx = rag.resolve_context(q_raw, history_payload)
-
     # append user msg immediately
     user_msg = {"id": str(uuid4()), "role": "user", "content": question, "ts": _now_ms()}
     messages: List[Dict[str, Any]] = (sess.get("messages") or []) + [user_msg]
 
-    # ---------- RETRIEVAL STAGE (history-aware) ----------
+    # ---------- RETRIEVAL + ANSWER (synchronous; fast) ----------
     t0 = time.perf_counter()
-    q_eff = ctx.augmented_query if ctx.follow_up else q_raw
-    lo, hi = rag.time_tags(q_eff)
-    ex = rag.parse_not(q_eff)
+    q_norm = rag.norm(question); lo, hi = rag.time_tags(q_norm); ex = rag.parse_not(q_norm)
 
-    # guardrail: only for new queries OR follow-ups with no usable context
-    if not (ctx.follow_up and (history_payload.get("prior_docs") or [])):
-        guard = rag.guardrail_domain(q_eff)
-        if not guard.get("domain_relevant", False):
-            right_pane = _right_pane_from_docs([], [], {"retrieve_ms": 0, "summarize_ms": 0}, overview={
-                "conclusion": "The query didn’t look biomedical. Try clinical/biomedical terms.",
-                "key_findings": [],
-                "quality_and_limits": []
-            }, intent={"follow_up": ctx.follow_up, "reason": ctx.reason, "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief})
-            assistant_msg = {
-                "id": str(uuid4()),
-                "role": "assistant",
-                "content": "We can’t search relevant biomedical terms for this question.",
-                "ts": _now_ms(),
-                "references": [],
-            }
-            messages.append(assistant_msg)
-            update_session(session_id, user_id, {"messages": messages, "rightPane": right_pane})
-            return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane}
+    # intent + guardrail
+    ctx = rag.resolve_context(q_norm, history_payload)
+    mode = rag.detect_mode(q_norm)
+    guard = rag.guardrail_domain(q_norm)
+    if not guard.get("domain_relevant", False) and not ctx.follow_up:
+        right_pane = _right_pane_from_docs([], [], {"retrieve_ms": 0, "summarize_ms": 0}, overview={
+            "conclusion": "The query didn’t look biomedical. Try clinical/biomedical terms.",
+            "key_findings": [],
+            "quality_and_limits": []
+        }, intent={"follow_up": ctx.follow_up, "reason": ctx.reason, "mode": mode})
+        assistant_msg = {
+            "id": str(uuid4()),
+            "role": "assistant",
+            "content": "We can’t search relevant biomedical terms for this question.",
+            "ts": _now_ms(),
+            "references": [],
+        }
+        messages.append(assistant_msg)
+        update_session(session_id, user_id, {"messages": messages, "rightPane": right_pane})
+        return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane}
 
-    # plan + compose variants
-    try:
-        plan = rag.plan_tokens(q_eff)
-    except Exception:
-        plan = {"chunks":[t for t in rag.tok(q_eff) if t.lower() not in rag.STOP][:4],"anchors":{},"domain_relevant":True}
+    # pipeline
+    pipe = rag.run_pipeline(question, role=role, history=history_payload)
+    docs_payload = pipe.get("docs") or []
+    timings = pipe.get("timings") or {"retrieve_ms": 0, "summarize_ms": 0}
+    intent_payload = pipe.get("intent") or {}
+    right_pane = _right_pane_from_docs(docs_payload, pipe.get("booleans") or [], timings, overview=None, intent=intent_payload)
 
-    variants = rag.compose(plan, lo, hi, ex, qlen=len(rag.tok(q_eff)))
-    tried_booleans, merged = [], {}
-
-    # allow direct PMID short-circuit
-    for pid in rag._extract_pmids_from_query(q_eff):
-        for d in rag._fetch_docs_by_pmids([pid]):
-            merged[d.pmid] = d
-
-    for v in variants:
-        tried_booleans.append({"label": v["label"], "query": v["query"]})
-        try:
-            if not rag.esearch(v["query"], rag.CFG.pubmed.retmax_probe):  # cheap probe
-                continue
-            for d in rag.retrieve(v["query"], q_eff, v["label"]):
-                merged[d.pmid] = d
-            if len(merged) >= rag.CFG.retrieval.topk_titles:
-                break
-        except Exception:
-            continue
-
-    if len(merged) < rag.CFG.retrieval.min_final:
-        for lv in rag.widen_variants(plan, q_eff, lo, hi, ex):
-            tried_booleans.append({"label": lv["label"], "query": lv["query"]})
-            try:
-                if not rag.esearch(lv["query"], rag.CFG.pubmed.retmax_probe):  # cheap probe
-                    continue
-                for d in rag.retrieve(lv["query"], q_eff, lv["label"]):
-                    if d.pmid not in merged:
-                        merged[d.pmid] = d
-                if len(merged) >= rag.CFG.retrieval.min_final:
-                    break
-            except Exception:
-                continue
-
-    if not merged:
-        try:
-            fb = rag.ultra_relaxed(q_eff, lo, hi, ex)
-            tried_booleans.append({"label":"fallback_compact","query":fb})
-            for d in rag.retrieve(fb, q_eff, "fallback_compact"):
-                merged[d.pmid] = d
-        except Exception:
-            pass
-
-    # add history docs if follow-up
-    if ctx.follow_up and history_payload.get("prior_docs"):
-        for dd in history_payload["prior_docs"]:
-            d = rag._to_doc(dd)
-            if d and d.pmid not in merged:
-                merged[d.pmid] = d
-
-    all_docs = list(merged.values())
-    final_docs = rag.fuse_mmr(q_eff, all_docs) if all_docs else []
-    used_docs = final_docs if final_docs else all_docs
-
-    t_retrieve_end = time.perf_counter()
-    timings_now = {"retrieve_ms": int((t_retrieve_end - t0)*1000), "summarize_ms": 0}
-
-    # prepare right pane (results only) + placeholder assistant message
-    docs_payload = [{
-        "pmid": d.pmid, "title": d.title, "journal": d.journal, "year": d.year,
-        "url": rag.pmid_url(d.pmid), "scores": d.scores, "abstract": d.abstract
-    } for d in used_docs]
-
-    intent_payload = {"follow_up": ctx.follow_up, "reason": ctx.reason, "augmented_query": ctx.augmented_query, "chat_brief": ctx.brief}
-    right_pane_initial = _right_pane_from_docs(docs_payload, tried_booleans, timings_now, overview=None, intent=intent_payload)
-    references_initial = _mk_references_from_rightpane(right_pane_initial)
+    # answer text
+    summary_obj = pipe.get("summary") or {}
+    assistant_text = _assistant_text_from_summary(summary_obj, right_pane["results"])
+    references = _mk_references_from_rightpane(right_pane)
 
     assistant_msg = {
         "id": str(uuid4()),
         "role": "assistant",
-        "content": "",  # to be filled by background summary
+        "content": assistant_text,
         "ts": _now_ms(),
-        "references": references_initial,
+        "references": references,
     }
     messages.append(assistant_msg)
 
     update_session(session_id, user_id, {
         "messages": messages,
         "meta": sess.get("meta") or {},
-        "rightPane": right_pane_initial
+        "rightPane": right_pane
     })
 
-    # ---------- SUMMARY STAGE (background; history-aware) ----------
-    # exact single if we ended with exactly one doc AND user didn't explicitly list multiple pmids
-    exact_single = len(used_docs) == 1 and not rag._extract_pmids_from_query(q_eff)
+    # log (non-blocking best-effort)
+    try:
+        create_log({
+            "user_id": user_id,
+            "session_id": session_id,
+            "query": question,
+            "response": assistant_text[:8000],
+            "fetch_ms": int(timings.get("retrieve_ms") or 0),
+            "summarize_ms": int(timings.get("summarize_ms") or 0),
+            "n_results": int(len(docs_payload)),
+            "ts": datetime.utcnow().isoformat(),
+        })
+    except Exception as e:
+        print(f"[LOGS] failed to write log: {e!r}")
 
-    def _finish_summary():
-        t_sum_start = time.perf_counter()
-        try:
-            if ctx.follow_up and history_payload.get("prior_docs"):
-                prior = []
-                for dd in history_payload["prior_docs"]:
-                    d = rag._to_doc(dd)
-                    if d:
-                        prior.append(d)
-                summary_obj = rag.summarize_with_context(
-                    q_raw, used_docs, exact_flag=exact_single, role=role,
-                    history_brief=ctx.brief, prior_docs=prior
-                )
-            else:
-                summary_obj = rag.summarize(q_raw, used_docs, exact_flag=exact_single, role=role)
-        except Exception as e:
-            summary_obj = {"answer":{"conclusion": f"(summary error) {str(e)[:200]}", "key_findings": [], "quality_and_limits": [], "evidence_citations": []}, "citation_links": {}}
-        t_sum_end = time.perf_counter()
-
-        assistant_text = _assistant_text_from_summary(summary_obj, docs_payload)
-        refs = _mk_references_from_rightpane(right_pane_initial)
-
-        # update session: replace placeholder message content; enrich rightPane with overview + timings
-        doc = get_session_by_id(session_id, user_id) or {}
-        msgs = doc.get("messages") or []
-        new_msgs = []
-        for m in msgs:
-            if m.get("id") == assistant_msg["id"]:
-                nm = dict(m)
-                nm["content"] = assistant_text
-                nm["references"] = refs
-                new_msgs.append(nm)
-            else:
-                new_msgs.append(m)
-
-        rp = doc.get("rightPane") or right_pane_initial
-        rp["overview"] = {
-            "conclusion": (summary_obj.get("answer") or {}).get("conclusion",""),
-            "key_findings": (summary_obj.get("answer") or {}).get("key_findings", []),
-            "quality_and_limits": (summary_obj.get("answer") or {}).get("quality_and_limits", []),
-        }
-        rp["timings"] = {
-            "retrieve_ms": timings_now["retrieve_ms"],
-            "summarize_ms": int((t_sum_end - t_sum_start)*1000),
-        }
-
-        # persist messages + right pane
-        update_session(session_id, user_id, {"messages": new_msgs, "rightPane": rp})
-
-        # persist short-term memory in session.meta (3-turn ring)
-        try:
-            doc_after = get_session_by_id(session_id, user_id) or {}
-            _store_session_meta_after_answer(session_id, user_id, doc_after, docs_payload, intent_payload)
-        except Exception as e:
-            print(f"[META] failed to write short memory: {e!r}")
-
-        try:
-            create_log({
-                "user_id": user_id,
-                "session_id": session_id,
-                "query": question,
-                "response": assistant_text[:8000],
-                "fetch_ms": int(timings_now["retrieve_ms"]),
-                "summarize_ms": int((t_sum_end - t_sum_start)*1000),
-                "n_results": int(len(used_docs)),
-                "ts": datetime.utcnow().isoformat(),
-                # extra observability
-                "intent_follow_up": bool(ctx.follow_up),
-                "used_context": bool(history_payload.get("prior_docs")),
-            })
-        except Exception as e:
-            print(f"[LOGS] failed to write log: {e!r}")
-
-    background_tasks.add_task(_finish_summary)
-
-    # return immediately with references
-    return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane_initial}
+    return {"session_id": session_id, "message": assistant_msg, "rightPane": right_pane}
