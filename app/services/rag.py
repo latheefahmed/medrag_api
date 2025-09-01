@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-# app/services/rag.py
+
 
 import os, re, json, time, textwrap, requests, numpy as np
 from dataclasses import dataclass, field, asdict
@@ -9,7 +8,6 @@ from urllib3.util import Retry
 from rank_bm25 import BM25Okapi
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-# ---- optional embedding cache (in-memory or Qdrant via app.services.embed_cache) ----
 try:
     from app.services.embed_cache import (
         cache_query_vec, cache_doc_vec,
@@ -21,7 +19,7 @@ except Exception:
     def try_get_query_vec(*a, **k): return None
     def try_get_doc_vecs(*a, **k): return {}
 
-# ================= config =================
+
 @dataclass
 class PPLXCfg:
     url: str = "https://api.perplexity.ai/chat/completions"
@@ -37,7 +35,6 @@ class PPLXCfg:
 
 @dataclass
 class GeminiCfg:
-    # flash is fast; switch to pro if you prefer more reasoning
     url: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     temperature: float = float(os.getenv("GEMINI_TEMPERATURE", "0.2"))
     max_output_tokens: int = int(os.getenv("GEMINI_MAX_TOKENS", "900"))
@@ -62,19 +59,18 @@ class RankCfg:
     w_bonus: float = 0.05
     mmr_lambda: float = 0.70
     mmr_take: int = 10
-    # confidence gating on fused score (normalized 0..1)
     min_norm_keep: float = float(os.getenv("FUSE_MIN_NORM", "0.35"))
 
 @dataclass
 class RetrievalCfg:
     topk_titles: int = 12
     final_take: int = 10
-    min_final: int = 5   # keep ≥5; set to 3 if you want "3–5"
+    min_final: int = 5   
 
 @dataclass
 class SummaryCfg:
     top_docs_for_pack: int = 5
-    abstract_chars: int = 800   # give a little more room for rich packs
+    abstract_chars: int = 800  
 
 @dataclass
 class BooleanCfg:
@@ -118,7 +114,6 @@ def _session():
 S = _session()
 _sleep = lambda: time.sleep(CFG.pubmed.sleep_with_key if PUBMED_KEY else CFG.pubmed.sleep_no_key)
 
-# ================= utils =================
 STOP = set(("a an and or but the is are was were be been being of in on at to for from with without vs versus compared "
             "as by into about across after before between within than which who whom whose what when where why how do does did "
             "done doing not no nor exclude excluding except only more most less least over under this these those such same other "
@@ -141,7 +136,6 @@ def _quantile(x: np.ndarray, q: float) -> float:
     q = min(0.99, max(0.01, q))
     return float(np.quantile(x, q))
 
-# --- citation coercion helper ---
 def _coerce_citations(raw, max_idx: int) -> List[int]:
     out: List[int] = []
     for x in (raw or []):
@@ -158,7 +152,6 @@ def _coerce_citations(raw, max_idx: int) -> List[int]:
             out.append(idx)
     return out
 
-# ================= embeddings =================
 class Embedder:
     def __init__(self, name): self._li = HuggingFaceEmbedding(model_name=name)
     def encode(self, texts, batch):
@@ -176,7 +169,6 @@ def embed(texts: List[str]) -> np.ndarray:
     if not texts: return np.zeros((0, 768), dtype=np.float32)
     return _EMB.encode(texts, CFG.rank.embed_batch)
 
-# ================= LLM drivers (PPLX + Gemini fallback) =================
 def _need_pplx():
     if not PPLX_KEY:
         raise RuntimeError("Perplexity API key missing or invalid (set PERPLEXITY_API_KEY).")
@@ -237,7 +229,7 @@ def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
         parts.append(f"[{role}]\n{m.get('content','')}\n")
     return "\n".join(parts)
 
-# ================= guardrails =================
+
 def guardrail_domain(query: str) -> Dict[str, Any]:
     sys = textwrap.dedent("""
     You are a strict gatekeeper for a PubMed-backed biomedical QA system.
@@ -248,8 +240,6 @@ def guardrail_domain(query: str) -> Dict[str, Any]:
     JSON schema: {"domain_relevant": true, "reason": "short justification"}
     """).strip()
     user = json.dumps({"query": norm(query)}, ensure_ascii=False)
-
-    # Try PPLX, then Gemini, then heuristic
     try:
         content = pplx(
             [{"role":"system","content":sys},
@@ -273,7 +263,6 @@ def guardrail_domain(query: str) -> Dict[str, Any]:
     words = [t for t in tok(query) if t.lower() not in STOP]
     return {"domain_relevant": len(words) >= 2, "reason": "Heuristic fallback"}
 
-# ================= planner =================
 def plan_tokens(query):
     sys = textwrap.dedent("""
     You are a biomedical retrieval planner. Output STRICT JSON only.
@@ -286,7 +275,6 @@ def plan_tokens(query):
         {"role":"user","content":json.dumps({"query": norm(query)}, ensure_ascii=False)}
     ]
 
-    # Try PPLX then Gemini then fallback heuristics
     try:
         content = pplx(messages, CFG.pplx.model_plan, CFG.pplx.search_mode_plan, temp=0.0, maxtok=500)
         js = json_from_text(content)
@@ -319,7 +307,6 @@ def plan_tokens(query):
     js["domain_relevant"] = bool(js.get("domain_relevant", True))
     return js
 
-# ================= boolean composer =================
 def _cluster(terms, k, thr):
     items = list(dict.fromkeys([norm(t).lower() for t in terms if t and t.lower() not in STOP]))
     if not items: return []
@@ -369,7 +356,6 @@ def compose(plan, lo, hi, ex, qlen: int):
         vs.append({"label": "chunks_compact", "query": _guards(fb, lo, hi, ex)})
     return vs
 
-# ================= PubMed I/O =================
 def _eutils(path, params, as_json):
     p = {**params, "tool": CFG.pubmed.tool, "email": CFG.pubmed.email}
     if PUBMED_KEY: p["api_key"] = PUBMED_KEY
@@ -399,7 +385,6 @@ def efetch(ids):
         out[pid] = {"abstract": abst, "pubtypes": ptypes}
     return out
 
-# ================= ranking =================
 @dataclass
 class Doc:
     pmid: str
@@ -460,18 +445,15 @@ def retrieve(boolean, nl, label):
 
     if not titles: return []
 
-    # Pass 1: title-only BM25 to get K
     b_title = _bm25_scores(nl, titles)
     idx = sorted(range(len(titles)), key=lambda i: -b_title[i])[:CFG.retrieval.topk_titles]
     pick_ids = [order[i] for i in idx]
 
-    # Fetch abstracts for top-K
     try:
         abs_map = efetch(pick_ids)
     except Exception:
         abs_map = {}
 
-    # Pass 2: recompute BM25 on title+abstract for accuracy
     docs_text = []
     for pid in pick_ids:
         ttl = meta[pid]["title"]
@@ -511,21 +493,20 @@ def fuse_mmr(query, docs):
     fused = CFG.rank.w_cos  * minmax(cos)  + CFG.rank.w_bm25 * minmax(bm25) + CFG.rank.w_bonus* minmax(bon)
     fused_norm = minmax(fused)
 
-    # Confidence gating: drop tails but keep at least min_final
+
     keep = [i for i, s in enumerate(fused_norm) if s >= max(CFG.rank.min_norm_keep, _quantile(fused_norm, 0.35))]
     if len(keep) < CFG.retrieval.min_final:
         keep = list(np.argsort(-fused_norm)[:CFG.retrieval.min_final])
 
-    # Now diversity with MMR on the kept set
     Dk = D[keep]; dk = [docs[i] for i in keep]
     picks = mmr(qv, Dk, CFG.rank.mmr_lambda, min(CFG.retrieval.final_take, len(dk)))
     chosen = [dk[i] for i in picks]
 
-    # annotate
+
     for i, d in enumerate(docs):
         d.scores = {**(d.scores or {}), "cos": float(cos[i]), "bonus": float(bon[i]), "fused_raw": float(fused[i]), "fused_norm": float(fused_norm[i])}
 
-    # cache vectors for chosen subset
+
     try:
         for i, d in zip(picks, chosen):
             cache_doc_vec(d.pmid, d.title, d.journal, d.year, d.abstract, Dk[i])
@@ -534,7 +515,6 @@ def fuse_mmr(query, docs):
 
     return chosen
 
-# ================= evidence + summary =================
 def evidence_pack(docs, cap=5):
     chosen = docs[:cap]; idx2url = {}; lines = []
     for i, d in enumerate(chosen, 1):
@@ -611,7 +591,7 @@ def summarize(query, docs, exact_flag=False, role: Optional[str]=None):
             "citation_links": links,
             "note":"Fallback summary used."}
 
-# ================= helpers =================
+
 def time_tags(q):
     ql = q.lower()
     m_b = re.search(r"\bbetween\s+((?:19|20)\d{2})\s+(?:and|-|to)\s+((?:19|20)\d{2})\b", ql)
@@ -646,7 +626,7 @@ def widen_variants(plan, q, lo, hi, ex):
     chans.append({"label":"ultra_relaxed","query": ultra_relaxed(q, lo, hi, [])})
     return chans
 
-# ================= pipeline =================
+
 def _guardrail_payload(chunks, lo, hi, ex, tried, reason: str = ""):
     base = "We can’t search relevant keywords from our PubMed-backed database. Please try another query using healthcare or biomedical terminology."
     msg = base if not reason else f"{base} {reason}".strip()
@@ -741,7 +721,7 @@ def run_pipeline(query, role: Optional[str] = None):
         },
     }
 
-# ================= FE compatibility shim =================
+
 def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = False) -> Tuple[str, Dict[str, Any]]:
     pipe = run_pipeline(question, role=role)
     summary = pipe.get("summary") or {}; docs = pipe.get("docs") or []

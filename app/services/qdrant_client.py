@@ -1,4 +1,4 @@
-# app/services/qdrant_client.py
+
 from __future__ import annotations
 import os, time
 from functools import lru_cache
@@ -21,7 +21,6 @@ def _client():
         return None
     try:
         from qdrant_client import QdrantClient
-        # prefer HTTP URL (Qdrant Cloud or self-hosted)
         if QDRANT_API_KEY:
             return QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=10.0)
         return QdrantClient(url=QDRANT_URL, timeout=10.0)
@@ -66,7 +65,6 @@ def upsert_vectors(items: Iterable[Tuple[str, np.ndarray, Dict]]):
         if pts:
             client.upsert(collection_name=QDRANT_COLLECTION, points=pts, wait=False)
     except Exception:
-        # best-effort: ignore all failures
         pass
 
 def get_vectors_by_ids(ids: List[str]) -> Dict[str, np.ndarray]:
@@ -79,7 +77,6 @@ def get_vectors_by_ids(ids: List[str]) -> Dict[str, np.ndarray]:
         return out
     try:
         ensure_collection()
-        # retrieve returns payload+vector
         points = client.retrieve(
             collection_name=QDRANT_COLLECTION,
             ids=ids,

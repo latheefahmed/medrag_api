@@ -1,4 +1,4 @@
-# app/schemas_rag.py
+
 from typing import List, Optional
 from pydantic import BaseModel
 
@@ -39,9 +39,8 @@ class RightPaneData(BaseModel):
     evidence: List[EvidenceItem] = []
     overview: Optional[Overview] = None
     plan: Optional[PlanLite] = None
-    evidencePack: Optional[str] = None  # camelCase to match FE
+    evidencePack: Optional[str] = None 
 
-# Additional type you might want to expose elsewhere
 class Reference(BaseModel):
     pmid: Optional[str] = None
     title: str

@@ -1,4 +1,4 @@
-# app/util.py
+
 import time, secrets
 
 def now_ms() -> int:

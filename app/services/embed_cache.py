@@ -1,5 +1,4 @@
-# -*- coding: utf-8 -*-
-# app/services/embed_cache.py
+
 from __future__ import annotations
 
 import hashlib
@@ -14,11 +13,9 @@ from .qdrant_client import upsert_vectors, get_vectors_by_ids
 
 log = logging.getLogger(__name__)
 
-# Expected embedding size (S-PubMedBERT = 768). Adjustable via env without code changes.
 _EXPECTED_DIM = int(os.getenv("QDRANT_VECTOR_SIZE", "768"))
 
 
-# ---------------- ids ----------------
 def _h(text: str) -> str:
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
 
@@ -28,11 +25,9 @@ def query_id(query: str) -> str:
 
 
 def doc_id(pmid: str, abstract: str) -> str:
-    # include abstract hash so retracted/updated abstracts don't collide
     return f"{pmid}:{_h((abstract or '').strip())}"
 
 
-# ---------------- helpers ----------------
 def _sanitize_vec(vec: Iterable[float], expected: Optional[int] = _EXPECTED_DIM) -> List[float]:
     """
     Ensure the vector is JSON-serializable (list[float]) and finite.

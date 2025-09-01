@@ -20,7 +20,7 @@ import app.services.rag as rag
 
 router = APIRouter(prefix="/ask", tags=["ask"])
 
-# --------- Accept both old/new FE payloads gracefully ----------
+
 class AskBody(BaseModel):
     session_id: Optional[str] = None
     id: Optional[str] = None
@@ -132,7 +132,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
     user_msg = {"id": str(uuid4()), "role": "user", "content": question, "ts": _now_ms()}
     messages: List[Dict[str, Any]] = (sess.get("messages") or []) + [user_msg]
 
-    # ---------- RETRIEVAL ----------
+
     t0 = time.perf_counter()
     q = rag.norm(question); lo, hi = rag.time_tags(q); ex = rag.parse_not(q)
 
@@ -227,7 +227,7 @@ async def ask(body: AskBody, background_tasks: BackgroundTasks, user=Depends(get
         "rightPane": right_pane_initial
     })
 
-    # ---------- SUMMARY (background) ----------
+
     exact_single = len(merged) == 1
 
     def _finish_summary():

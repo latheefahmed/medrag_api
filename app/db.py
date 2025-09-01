@@ -1,4 +1,4 @@
-# app/db.py
+
 import os
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple
@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ---- Config / Defaults ----
 DEFAULT_DB = os.getenv("COSMOS_DB", "medrag")
 USERS_CONTAINER = os.getenv("COSMOS_USERS_CONTAINER", "users")
 SESS_CONTAINER  = os.getenv("COSMOS_SESSIONS_CONTAINER", "sessions")
@@ -32,13 +31,11 @@ def _handles():
 
     client = CosmosClient(url, credential=key)
 
-    # Database
     try:
         db = client.create_database_if_not_exists(db_name)
     except exceptions.CosmosResourceExistsError:
         db = client.get_database_client(db_name)
 
-    # users (pk=/email)
     try:
         users = db.create_container_if_not_exists(
             id=USERS_CONTAINER, partition_key=PartitionKey(path="/email"),
@@ -46,7 +43,6 @@ def _handles():
     except exceptions.CosmosResourceExistsError:
         users = db.get_container_client(USERS_CONTAINER)
 
-    # sessions (pk=/user_id)
     try:
         sessions = db.create_container_if_not_exists(
             id=SESS_CONTAINER, partition_key=PartitionKey(path="/user_id"),
@@ -54,7 +50,6 @@ def _handles():
     except exceptions.CosmosResourceExistsError:
         sessions = db.get_container_client(SESS_CONTAINER)
 
-    # logs (pk=/user_id)
     try:
         logs = db.create_container_if_not_exists(
             id=LOGS_CONTAINER, partition_key=PartitionKey(path="/user_id"),
@@ -65,7 +60,6 @@ def _handles():
     return client, db, users, sessions, logs
 
 
-# ---------- Exposed handles ----------
 @lru_cache()
 def get_client() -> CosmosClient:
     client, *_ = _handles()
@@ -159,8 +153,6 @@ def ensure_cosmos() -> Dict[str, Any]:
         info["error"] = str(e)
     return info
 
-
-# ============================ Users ============================
 def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     if not email:
         return None
@@ -224,7 +216,7 @@ def list_sessions_all(limit: int = 200) -> List[Dict[str, Any]]:
     return items[:limit]
 
 
-# ============================ Sessions ============================
+
 def create_session(sess: Dict[str, Any]) -> Dict[str, Any]:
     sessions = get_sessions_container()
     user_id = (sess.get("user_id") or "").strip()
@@ -295,7 +287,7 @@ def delete_session(session_id: str, user_id: str) -> bool:
     return _safe_delete_item(sessions, session_id, pk_value)
 
 
-# ---------- Backwards-compat shims ----------
+
 def list_sessions(user_id: str, limit: int = 50):
     return list_sessions_for_user(user_id, limit)
 
@@ -317,7 +309,6 @@ def upsert_session(session_id: str, user_id: str, patch: dict | None = None):
         })
 
 
-# ============================ Logs ============================
 def create_log(entry: Dict[str, Any]) -> Dict[str, Any]:
     """
     Stores a Chat log row:
@@ -334,7 +325,7 @@ def create_log(entry: Dict[str, Any]) -> Dict[str, Any]:
         "user_id": user_id,
         "session_id": entry.get("session_id") or "",
         "query": entry.get("query") or "",
-        "response": (entry.get("response") or "")[:16000],  # trim to keep doc small
+        "response": (entry.get("response") or "")[:16000], 
         "fetch_ms": int(entry.get("fetch_ms") or 0),
         "summarize_ms": int(entry.get("summarize_ms") or 0),
         "n_results": int(entry.get("n_results") or 0),
@@ -364,7 +355,7 @@ def write_chat_log(entry: Dict[str, Any]) -> Dict[str, Any]:
     - answer_preview -> response
     Everything else is passed through.
     """
-    # normalize known keys without losing anything else
+
     e = dict(entry or {})
     if "retrieval_ms" in e and "fetch_ms" not in e:
         e["fetch_ms"] = int(e.get("retrieval_ms") or 0)

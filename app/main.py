@@ -1,16 +1,15 @@
-# app/main.py
+
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Load .env locally (no-op in ACA if python-dotenv isn't present)
 try:
-    from dotenv import load_dotenv  # type: ignore
+    from dotenv import load_dotenv 
     load_dotenv()
 except Exception:
     pass
 
-# Absolute imports are safer inside containers
+
 from app.routers import auth, sessions, ask, debug
 from app.db import ensure_cosmos
 
@@ -32,7 +31,6 @@ def _parse_cors_origins() -> list[str]:
     fe = (os.getenv("FRONTEND_ORIGIN") or "").strip()
     if fe:
         origins.add(fe)
-    # local dev fallback
     if not origins:
         origins.add("http://localhost:3000")
     return sorted(origins)
@@ -41,7 +39,6 @@ def _parse_cors_origins() -> list[str]:
 def create_app() -> FastAPI:
     app = FastAPI(title="MedRAG API", version="0.1.0")
 
-    # CORS for FE (with cookies)
     allow = _parse_cors_origins()
     app.add_middleware(
         CORSMiddleware,
@@ -51,18 +48,16 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # Routers
     app.include_router(auth.router)
     app.include_router(sessions.router)
     app.include_router(ask.router)
-    app.include_router(debug.router)  # contains /debug/health
+    app.include_router(debug.router)
 
     @app.on_event("startup")
     def _startup_probe():
         try:
             ensure_cosmos()
         except Exception as e:
-            # Log and continue so the server can still start
             print(f"[WARN] Cosmos not available at startup: {e}")
 
     return app

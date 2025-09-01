@@ -59,7 +59,7 @@ def logout(response: Response):
     return {"ok": True}
 
 
-# ---------- Email verification ----------
+
 class ResendBody(BaseModel):
     email: EmailStr | None = None
 
@@ -67,7 +67,7 @@ class ResendBody(BaseModel):
 @router.post("/resend-verification")
 async def resend_verification(request: Request, body: ResendBody | None = None, current=Depends(get_optional_user)):
     email = current.get("email") if current else (str(body.email).lower().strip() if body and body.email else None)
-    # Always 200 to avoid enumeration
+    
     if not email:
         return {"ok": True}
     u = get_user_by_email(email)
@@ -97,7 +97,7 @@ def verify(token: str):
     return {"ok": True, "verified": True}
 
 
-# ---------- Password reset ----------
+
 class ResetRequestBody(BaseModel):
     email: EmailStr
 
@@ -107,7 +107,6 @@ class DoResetBody(BaseModel):
 
 @router.post("/request-reset")
 def request_reset(body: ResetRequestBody):
-    # Always 200 to avoid enumeration
     try:
         email = str(body.email).lower().strip()
         if get_user_by_email(email):
@@ -128,7 +127,7 @@ def do_reset(body: DoResetBody):
         raise HTTPException(status_code=400, detail="Invalid or expired token")
 
     u = get_user_by_email(email)
-    if not u:  # still 200 for safety
+    if not u:
         return {"ok": True}
     update_user(email, {"password_hash": get_password_hash(body.password)})
     return {"ok": True}
