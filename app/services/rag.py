@@ -1,5 +1,3 @@
-
-
 import os, re, json, time, textwrap, requests, numpy as np
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Any, Optional, Tuple
@@ -8,6 +6,7 @@ from urllib3.util import Retry
 from rank_bm25 import BM25Okapi
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
+# ---- optional embedding cache (in-memory or Qdrant via app.services.embed_cache) ----
 try:
     from app.services.embed_cache import (
         cache_query_vec, cache_doc_vec,
@@ -19,7 +18,9 @@ except Exception:
     def try_get_query_vec(*a, **k): return None
     def try_get_doc_vecs(*a, **k): return {}
 
-
+# ================================
+# Config
+# ================================
 @dataclass
 class PPLXCfg:
     url: str = "https://api.perplexity.ai/chat/completions"
@@ -28,7 +29,7 @@ class PPLXCfg:
     model_guard: str = os.getenv("PPLX_MODEL_GUARD", "sonar-pro")
     model_intent: str = os.getenv("PPLX_MODEL_INTENT", "sonar-mini")
     temperature: float = float(os.getenv("PPLX_TEMPERATURE", "0.15"))
-    max_tokens: int = int(os.getenv("PPLX_MAX_TOKENS", "900"))
+    max_tokens: int = int(os.getenv("PPLX_MAX_TOKENS", "1200"))
     search_mode_plan: Optional[str] = "academic"
     search_mode_summary: Optional[str] = None
     search_mode_intent: Optional[str] = None
@@ -37,7 +38,7 @@ class PPLXCfg:
 class GeminiCfg:
     url: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     temperature: float = float(os.getenv("GEMINI_TEMPERATURE", "0.2"))
-    max_output_tokens: int = int(os.getenv("GEMINI_MAX_TOKENS", "900"))
+    max_output_tokens: int = int(os.getenv("GEMINI_MAX_TOKENS", "1200"))
 
 @dataclass
 class PubMedCfg:
@@ -65,12 +66,12 @@ class RankCfg:
 class RetrievalCfg:
     topk_titles: int = 12
     final_take: int = 10
-    min_final: int = 5   
+    min_final: int = 5
 
 @dataclass
 class SummaryCfg:
-    top_docs_for_pack: int = 5
-    abstract_chars: int = 800  
+    top_docs_for_pack: int = 5     # evidence pack size (1..5 typical)
+    abstract_chars: int = 1200     # show longer abstract slices in the pack
 
 @dataclass
 class BooleanCfg:
@@ -136,22 +137,34 @@ def _quantile(x: np.ndarray, q: float) -> float:
     q = min(0.99, max(0.01, q))
     return float(np.quantile(x, q))
 
-def _coerce_citations(raw, max_idx: int) -> List[int]:
+def _coerce_citations(raw, max_idx: int, must_include: List[int], cap: int) -> List[int]:
+    """Parse, dedupe, clamp to [1..max_idx], force-include 'must_include', cap to N."""
     out: List[int] = []
+    # force include first so order starts with 1,2,3 if present
+    for m in must_include:
+        if 1 <= m <= max_idx and m not in out:
+            out.append(m)
+    # then parse whatever model proposed
     for x in (raw or []):
         if isinstance(x, (int, float)):
             idx = int(x)
         elif isinstance(x, str):
             m = re.search(r"\d+", x)
-            if not m:
-                continue
+            if not m: continue
             idx = int(m.group(0))
         else:
             continue
         if 1 <= idx <= max_idx and idx not in out:
             out.append(idx)
-    return out
+    # finally, if still fewer than cap, fill in ascending order
+    i = 1
+    while len(out) < min(cap, max_idx):
+        if i not in out and 1 <= i <= max_idx:
+            out.append(i)
+        i += 1
+    return out[:min(cap, max_idx)]
 
+# ================= embedding =================
 class Embedder:
     def __init__(self, name): self._li = HuggingFaceEmbedding(model_name=name)
     def encode(self, texts, batch):
@@ -169,6 +182,7 @@ def embed(texts: List[str]) -> np.ndarray:
     if not texts: return np.zeros((0, 768), dtype=np.float32)
     return _EMB.encode(texts, CFG.rank.embed_batch)
 
+# ================= LLM helpers =================
 def _need_pplx():
     if not PPLX_KEY:
         raise RuntimeError("Perplexity API key missing or invalid (set PERPLEXITY_API_KEY).")
@@ -222,14 +236,13 @@ def json_from_text(t):
         except Exception: return None
 
 def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
-    # Flatten system+user messages into a single prompt for Gemini
     parts = []
     for m in messages:
         role = m.get("role", "user").upper()
         parts.append(f"[{role}]\n{m.get('content','')}\n")
     return "\n".join(parts)
 
-
+# ================= Guardrails + planning =================
 def guardrail_domain(query: str) -> Dict[str, Any]:
     sys = textwrap.dedent("""
     You are a strict gatekeeper for a PubMed-backed biomedical QA system.
@@ -307,6 +320,7 @@ def plan_tokens(query):
     js["domain_relevant"] = bool(js.get("domain_relevant", True))
     return js
 
+# ================= Boolean variants =================
 def _cluster(terms, k, thr):
     items = list(dict.fromkeys([norm(t).lower() for t in terms if t and t.lower() not in STOP]))
     if not items: return []
@@ -356,6 +370,7 @@ def compose(plan, lo, hi, ex, qlen: int):
         vs.append({"label": "chunks_compact", "query": _guards(fb, lo, hi, ex)})
     return vs
 
+# ================= E-utilities =================
 def _eutils(path, params, as_json):
     p = {**params, "tool": CFG.pubmed.tool, "email": CFG.pubmed.email}
     if PUBMED_KEY: p["api_key"] = PUBMED_KEY
@@ -385,6 +400,7 @@ def efetch(ids):
         out[pid] = {"abstract": abst, "pubtypes": ptypes}
     return out
 
+# ================= Retrieval + fusion =================
 @dataclass
 class Doc:
     pmid: str
@@ -493,7 +509,6 @@ def fuse_mmr(query, docs):
     fused = CFG.rank.w_cos  * minmax(cos)  + CFG.rank.w_bm25 * minmax(bm25) + CFG.rank.w_bonus* minmax(bon)
     fused_norm = minmax(fused)
 
-
     keep = [i for i, s in enumerate(fused_norm) if s >= max(CFG.rank.min_norm_keep, _quantile(fused_norm, 0.35))]
     if len(keep) < CFG.retrieval.min_final:
         keep = list(np.argsort(-fused_norm)[:CFG.retrieval.min_final])
@@ -502,10 +517,8 @@ def fuse_mmr(query, docs):
     picks = mmr(qv, Dk, CFG.rank.mmr_lambda, min(CFG.retrieval.final_take, len(dk)))
     chosen = [dk[i] for i in picks]
 
-
     for i, d in enumerate(docs):
         d.scores = {**(d.scores or {}), "cos": float(cos[i]), "bonus": float(bon[i]), "fused_raw": float(fused[i]), "fused_norm": float(fused_norm[i])}
-
 
     try:
         for i, d in zip(picks, chosen):
@@ -515,23 +528,36 @@ def fuse_mmr(query, docs):
 
     return chosen
 
+# ================= Evidence pack =================
 def evidence_pack(docs, cap=5):
-    chosen = docs[:cap]; idx2url = {}; lines = []
+    """Return pack text + link map. Always tries to surface up to 'cap' docs; includes abstracts."""
+    chosen = docs[:cap]
+    idx2url = {}; lines = []
     for i, d in enumerate(chosen, 1):
         idx2url[i] = pmid_url(d.pmid)
         head = f"[{i}] PMID {d.pmid} ({d.year}) {d.journal} — {d.title} ({idx2url[i]})".strip(" —")
-        body = f"Abstract: {d.abstract[:CFG.summary.abstract_chars]}" if d.abstract else "Abstract: (not available)"
+        if d.abstract:
+            body = f"Abstract: {d.abstract[:CFG.summary.abstract_chars]}"
+        else:
+            body = "Abstract: (not available)"
         lines.append(f"{head}\n{body}")
-    return "EVIDENCE PACK\n" + "\n\n".join(lines), idx2url
+    txt = "EVIDENCE PACK\n" + ("\n\n".join(lines) if lines else "No items.")
+    return txt, idx2url
 
 def _role_flavor(role: Optional[str]) -> str:
     r = (role or "").lower()
     if r in ("doctor","clinician","physician","md"):
-        return "Write clinically and concisely with effect sizes and guideline context; avoid advice."
+        return ("Write clinically and precisely; include effect sizes, absolute/relative risk, CIs, "
+                "time-to-event data, and practice-guideline context; no clinical advice.")
     if r in ("researcher","scientist"):
-        return "Use a technical tone; emphasize design, endpoints, estimates, and limits."
-    return "Use clear, precise prose without bullets or markdown."
+        return ("Use a technical tone; emphasize study design, endpoints, estimators, confounding, "
+                "statistical power, heterogeneity, and external validity.")
+    if r in ("data_analyst","biostatistician","analyst"):
+        return ("Use data-centric language; report models used, key coefficients, CIs, p-values, "
+                "model diagnostics, and sensitivity analyses.")
+    return "Use clear, precise prose; prefer concrete numbers over generalities."
 
+# ================= Summarization (enforces 1,2,3 + up to 5) =================
 def summarize(query, docs, exact_flag=False, role: Optional[str]=None):
     if not docs:
         return {"question":query,"answer":{"conclusion":"No eligible PubMed items found.","key_findings":[],"quality_and_limits":["Try broadening filters or removing exclusions."],"evidence_citations":[]}, "citation_links":{}}
@@ -539,25 +565,48 @@ def summarize(query, docs, exact_flag=False, role: Optional[str]=None):
     cap = CFG.summary.top_docs_for_pack
     pack, links = evidence_pack(docs, cap=cap)
 
-    flavor = "Every factual sentence must include bracket citations like [1][2]. Do not use asterisks, dashes, bullets, or markdown anywhere. "
-    if exact_flag: flavor += "Treat the single paper as an exact match. "
-    flavor += _role_flavor(role)
+    # Strong, role-aware, longer and non-vague guidance
+    base_rules = (
+        "Use ONLY the EVIDENCE PACK; do not browse. Prefer RCTs/meta-analyses/guidelines. "
+        "Avoid vagueness; every claim MUST be supported by bracket citations like [1][2]. "
+        "Do NOT use bullets/markdown or asterisks; write plain text JSON only. "
+        "Deliver a dense, technical summary (approx 250–450 words in 'conclusion'), followed by "
+        "succinct 'key_findings' and explicit 'quality_and_limits'. "
+        "You MUST explicitly address and compare the first three citations [1], [2], and [3] in your reasoning, "
+        "and include short notes for them in 'evidence_notes' keyed as '1','2','3'."
+    )
+    if exact_flag:
+        base_rules += " Treat the single closest-matching paper as an exact match when present. "
+    base_rules += " " + _role_flavor(role)
 
-    sys = ("Use ONLY the EVIDENCE PACK; do not browse. Prefer RCTs/meta-analyses/guidelines. Respond with JSON only. " + flavor)
     schema = {"question":"string","answer":{"conclusion":"string","key_findings":"array","quality_and_limits":"array","evidence_citations":"array","evidence_notes":"object"}}
-    user = f"QUESTION\n{query}\n\n{pack}\n\nTASK\nReturn MINIFIED JSON exactly in this schema (no prose):\n{json.dumps(schema,indent=2)}\nIf a field is missing in EVIDENCE PACK, write 'not reported'. Ensure every claim has bracket citations."
+
+    user = (
+        f"QUESTION\n{query}\n\n{pack}\n\nTASK\n"
+        f"Return MINIFIED JSON exactly in this schema (no prose):\n{json.dumps(schema,indent=2)}\n"
+        "Requirements:\n"
+        "- 'conclusion' = integrated narrative across all evidence; high technical density; no filler.\n"
+        "- 'key_findings' = concrete outcome-level findings with quantitative detail where present.\n"
+        "- 'quality_and_limits' = internal/external validity, risk of bias, heterogeneity, precision, sample sizes.\n"
+        "- 'evidence_citations' = list of indices that support your claims. MUST include 1,2,3 if they exist.\n"
+        "- 'evidence_notes' = brief 1–2 sentence notes for items '1','2','3' specifically (if they exist in the pack), "
+        "summarizing study design and primary quantitative result.\n"
+        "- Every sentence with facts must include bracket citations like [1][2]."
+    )
+
+    sys = base_rules + " Return STRICT MINIFIED JSON only."
 
     # Try PPLX; if it fails or non-JSON, fall back to Gemini
     js = None
     try:
-        content = pplx([{"role":"system","content":sys+" Return MINIFIED JSON only."},
+        content = pplx([{"role":"system","content":sys},
                         {"role":"user","content":user}],
-                       CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=900)
+                       CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=CFG.pplx.max_tokens)
         js = json_from_text(content)
         if not js:
             content2 = pplx([{"role":"system","content":sys},
                              {"role":"user","content":user}],
-                            CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=900)
+                            CFG.pplx.model_summary, CFG.pplx.search_mode_summary, temp=0.0, maxtok=CFG.pplx.max_tokens)
             js = json_from_text(content2)
     except Exception:
         js = None
@@ -565,33 +614,55 @@ def summarize(query, docs, exact_flag=False, role: Optional[str]=None):
     if not js:
         try:
             prompt = _messages_to_prompt(
-                [{"role":"system","content":sys + " Return STRICT JSON only."},
+                [{"role":"system","content":sys},
                  {"role":"user","content":user}]
             )
-            js = json_from_text(gemini_generate(prompt, temp=0.15, maxtok=900))
+            js = json_from_text(gemini_generate(prompt, temp=0.15, maxtok=CFG.gemini.max_output_tokens))
         except Exception:
             js = None
 
+    # Post-process: guarantee [1,2,3] presence when available and cap to top-5
+    max_idx = min(cap, len(docs))
+    must = [i for i in [1,2,3] if i <= max_idx]  # only enforce those that exist
     if js:
         ans = js.get("answer") or {}
         raw_cites = ans.get("evidence_citations") or js.get("evidence_citations") or []
-        ans["evidence_citations"] = _coerce_citations(raw_cites, max_idx=min(cap, len(docs)))
+        final_cites = _coerce_citations(raw_cites, max_idx=max_idx, must_include=must, cap=cap)
+        ans["evidence_citations"] = final_cites
         ans["key_findings"] = [str(x) for x in (ans.get("key_findings") or [])]
         ans["quality_and_limits"] = [str(x) for x in (ans.get("quality_and_limits") or [])]
+
+        # Ensure evidence_notes has keys '1','2','3' if available; synthesize minimal notes if missing
+        evn = ans.get("evidence_notes") or {}
+        for m in must:
+            k = str(m)
+            if k not in evn or not str(evn.get(k,"")).strip():
+                # synthesize a tight note from the title/abstract available in the pack
+                d = docs[m-1]
+                # very brief derived line, no hallucination beyond available fields
+                hint = (d.abstract or d.title or "").strip()
+                hint = hint[:180] + ("…" if len(hint) > 180 else "")
+                evn[k] = f"{d.journal} {d.year}: {hint}"
+        ans["evidence_notes"] = evn
+
         js["answer"] = ans
         js["citation_links"] = links
         return js
 
-    cites = list(range(1, min(cap, len(docs)) + 1))
+    # Full fallback if both models fail
+    cites = list(range(1, max_idx + 1))
+    cites = _coerce_citations(cites, max_idx=max_idx, must_include=must, cap=cap)
+    # Construct minimal but valid JSON
     return {"question":query,
-            "answer":{"conclusion":"See synthesized findings from the evidence pack [1].",
-                      "key_findings":[f"See items {cites} for key outcomes."],
-                      "quality_and_limits":["Automatic fallback summary; verify primary sources."],
-                      "evidence_citations": cites},
+            "answer":{"conclusion":"See synthesized findings from the evidence pack [1][2][3].",
+                      "key_findings":[f"See items {cites} for outcome details [1][2][3]."],
+                      "quality_and_limits":["Automatic fallback summary; verify primary sources [1][2][3]."],
+                      "evidence_citations": cites,
+                      "evidence_notes": {str(i): "see pack" for i in must}},
             "citation_links": links,
             "note":"Fallback summary used."}
 
-
+# ================= Time/exclusions helpers =================
 def time_tags(q):
     ql = q.lower()
     m_b = re.search(r"\bbetween\s+((?:19|20)\d{2})\s+(?:and|-|to)\s+((?:19|20)\d{2})\b", ql)
@@ -626,7 +697,6 @@ def widen_variants(plan, q, lo, hi, ex):
     chans.append({"label":"ultra_relaxed","query": ultra_relaxed(q, lo, hi, [])})
     return chans
 
-
 def _guardrail_payload(chunks, lo, hi, ex, tried, reason: str = ""):
     base = "We can’t search relevant keywords from our PubMed-backed database. Please try another query using healthcare or biomedical terminology."
     msg = base if not reason else f"{base} {reason}".strip()
@@ -641,6 +711,7 @@ def _guardrail_payload(chunks, lo, hi, ex, tried, reason: str = ""):
         "timings": {"retrieve_ms": 0, "summarize_ms": 0},
     }
 
+# ================= Pipeline =================
 def run_pipeline(query, role: Optional[str] = None):
     t0 = time.perf_counter()
     q = norm(query); lo, hi = time_tags(q); ex = parse_not(q)
@@ -721,7 +792,6 @@ def run_pipeline(query, role: Optional[str] = None):
         },
     }
 
-
 def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = False) -> Tuple[str, Dict[str, Any]]:
     pipe = run_pipeline(question, role=role)
     summary = pipe.get("summary") or {}; docs = pipe.get("docs") or []
@@ -740,13 +810,23 @@ def run_rag_pipeline(question: str, role: Optional[str] = None, verbose: bool = 
         cites = a.get("evidence_citations") or []
         links = {str(k): v for k, v in (summary.get("citation_links") or {}).items()}
 
+        # Ensure the displayed citation list includes all up to 5 (and 1..3 if present)
+        max_show = min(CFG.summary.top_docs_for_pack, len(docs))
+        needed = [i for i in [1,2,3] if i <= max_show]
+        full_tail = [i for i in range(1, max_show+1) if i not in needed]
+        display_cites = needed + [i for i in cites if i not in needed and i <= max_show]
+        # if still missing, append remaining indices up to max_show
+        for i in full_tail:
+            if i not in display_cites:
+                display_cites.append(i)
+
         lines = []
         if conclusion: lines += [conclusion, ""]
         if kf: lines += ["Key findings:", *kf, ""]
         if ql: lines += ["Quality and limitations:", *ql, ""]
-        if cites:
+        if display_cites:
             lines.append("Citations:")
-            for n in cites:
+            for n in display_cites:
                 try:
                     idx = int(n)
                 except Exception:
